@@ -1,3 +1,21 @@
+unreleased
+===
+
+* New producer option `IsolateFailedBatches` opts into per-batch failure
+  isolation. By default, when a buffered batch fails terminally (retry or
+  delivery-timeout exhaustion, a non-retryable broker error, a head-of-line
+  context cancellation), every record buffered in the same partition fails
+  with it to keep delivery gapless. With this option, only the failed head
+  batch is removed and later batches in the partition keep delivering, so a
+  short broker rolling restart that tips one batch over its retry budget no
+  longer reports the partition's entire never-sent backlog as failed.
+  Idempotent producers bump the producer epoch and restart the partition's
+  sequence when a written batch is dropped (an unwritten batch continues the
+  sequence); non-idempotent producers simply drop the head. The option is
+  incompatible with transactional IDs and `StopProducerOnDataLossDetected`;
+  termination paths (close, abort, purge, fatal producer-ID failure) still
+  fail the whole buffer.
+
 v1.22.3
 ===
 

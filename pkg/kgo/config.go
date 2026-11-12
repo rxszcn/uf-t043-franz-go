@@ -154,6 +154,13 @@ type cfg struct {
 	stopOnDataLoss bool
 	onDataLoss     func(string, int32)
 
+	// isolateFailedBatches opts into per-batch failure isolation: a batch
+	// that terminally fails is removed on its own and later batches buffered
+	// in the same partition keep being delivered, rather than every buffered
+	// record in the partition failing with it. Default false keeps the
+	// gapless-ordering fail-all semantics.
+	isolateFailedBatches bool
+
 	//////////////////////
 	// CONSUMER SECTION //
 	//////////////////////
@@ -247,6 +254,14 @@ func (cfg *cfg) validate() error {
 
 	if cfg.allowIdempotentProduceCancellation && cfg.txnID != nil {
 		return errors.New("cannot allow idempotent produce cancellation and use transactional IDs")
+	}
+	if cfg.isolateFailedBatches {
+		if cfg.txnID != nil {
+			return errors.New("cannot isolate failed produce batches and use transactional IDs")
+		}
+		if cfg.stopOnDataLoss {
+			return errors.New("cannot isolate failed produce batches and stop on data loss detected")
+		}
 	}
 	if cfg.disableIdempotency {
 		if cfg.txnID != nil {
@@ -1441,6 +1456,57 @@ func RecordRetries(n int) ProducerOpt {
 // If this is -1, the client never fails records with these errors.
 func UnknownTopicRetries(n int) ProducerOpt {
 	return producerOpt{func(cfg *cfg) { cfg.maxUnknownFailures = int64(n) }}
+}
+
+// IsolateFailedBatches opts into per-batch failure isolation, overriding the
+// default behavior where a terminally failed batch fails every record buffered
+// in its partition.
+//
+// By default, when a batch fails for good (retries or the delivery timeout
+// exhausted, a non-retryable broker error, a head-of-line context
+// cancellation), the client fails every buffered record in the same
+// partition. This keeps delivery gapless: a later record can never be
+// produced while an earlier one failed, which also keeps idempotent sequence
+// numbers internally simple. The cost is failure amplification - a short
+// broker rolling restart that tips one batch over its retry budget reports
+// the whole partition's backlog as failed, even though most of it was never
+// sent and would have delivered fine once the broker came back.
+//
+// With this option, only the batch that actually failed is removed and
+// failed to its promises; later batches in the partition remain buffered and
+// continue delivering.
+//
+// Semantics by mode:
+//
+//   - With idempotency disabled, there is no sequence chain to preserve. The
+//     failed head batch is dropped and later batches send immediately.
+//     Ordering is no longer gapless - later records can be produced while an
+//     earlier one failed - and a batch whose send outcome was unknown (a
+//     REQUEST_TIMED_OUT or NOT_ENOUGH_REPLICAS_AFTER_APPEND answered after
+//     the append) can land twice if the application re-produces it.
+//   - With idempotency enabled (the default), the failed head batch is
+//     dropped and, if it had ever been written in a request, the client
+//     bumps its producer epoch and resets the partition's sequence numbers
+//     before any later batch sends, so no sequence number is reused. The
+//     broker dedupes in-flight retries of the dropped batch under the old
+//     epoch. A batch that was never written is dropped without an epoch
+//     bump and later batches continue its sequence. Because an
+//     outcome-unknown failed batch may already be on the broker, an
+//     application-level re-produce of it is not deduplicated after the
+//     epoch bump and may duplicate, the same trade-off as
+//     [AllowIdempotentProduceCancellation].
+//
+// Termination paths are not isolated and still fail everything buffered:
+// client [Client.Close], [Client.AbortBufferedRecords], topic purge, a fatal
+// producer-ID or AddPartitionsToTxn failure, and a data-loss signal when
+// [StopProducerOnDataLossDetected] is set. Those either mean the client is
+// shutting down or that the partition's broker-side state can no longer be
+// reasoned about, so continuing would not be safe.
+//
+// This option is incompatible with specifying a transactional id and with
+// [StopProducerOnDataLossDetected].
+func IsolateFailedBatches() ProducerOpt {
+	return producerOpt{func(cfg *cfg) { cfg.isolateFailedBatches = true }}
 }
 
 // StopProducerOnDataLossDetected sets the client to stop producing if data

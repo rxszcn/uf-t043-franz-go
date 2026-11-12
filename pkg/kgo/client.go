@@ -372,6 +372,8 @@ func (cl *Client) OptValues(opt any) []any {
 		return []any{cfg.maxUnknownFailures}
 	case namefn(StopProducerOnDataLossDetected):
 		return []any{cfg.stopOnDataLoss}
+	case namefn(IsolateFailedBatches):
+		return []any{cfg.isolateFailedBatches}
 	case namefn(ProducerOnDataLossDetected):
 		return []any{cfg.onDataLoss}
 	case namefn(ProducerLinger):

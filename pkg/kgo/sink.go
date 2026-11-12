@@ -148,7 +148,7 @@ func (s *sink) createReq(id int64, epoch int16) (*produceRequest, *kmsg.AddParti
 			// drops inflight batches too, and the seq chain with them
 			// (see tryAddBatch). Their responses re-trigger the drain.
 			if batch == recBuf.batches[0] {
-				recBuf.failAllRecords(errMergedBatchUnsupported)
+				recBuf.failRecords(errMergedBatchUnsupported)
 			}
 			recBuf.mu.Unlock()
 			continue
@@ -454,7 +454,7 @@ func (s *sink) produce(sem <-chan struct{}) bool {
 						batch0.mu.Unlock()
 					}
 					if failAll {
-						recBuf.failAllRecords(err)
+						recBuf.failRecords(err)
 					}
 					recBuf.mu.Unlock()
 				}
@@ -872,7 +872,7 @@ func (s *sink) handleReqClientErr(req *produceRequest, err error) {
 				return
 			}
 			if !batch.unsureIfProduced || s.cl.cfg.disableIdempotency || s.cl.cfg.allowIdempotentProduceCancellation {
-				batch.owner.failAllRecords(err)
+				batch.owner.failRecords(err)
 			}
 		})
 		s.handleRetryBatches(req.batches, nil, req.backoffSeq, true, false, "produce request failed with a version error")
@@ -1339,10 +1339,12 @@ func (cl *Client) finishBatch(batch *recBatch, producerID int64, producerEpoch i
 	recBuf := batch.owner
 
 	if err != nil {
-		// We know that Kafka replied this batch is a failure. We can
-		// fail this batch and all batches in this partition.
-		// This will keep sequence numbers correct.
-		recBuf.failAllRecords(err)
+		// We know that Kafka replied this batch is a failure. With the
+		// default fail-all semantics we fail this batch and every batch in
+		// the partition, which keeps sequence numbers gapless. With failure
+		// isolation enabled, only this head batch is removed and later
+		// batches keep delivering (see failHeadBatch for the sequence work).
+		recBuf.failRecords(err)
 		return
 	}
 
@@ -1428,7 +1430,7 @@ func (s *sink) handleRetryBatches(
 
 		if (canFail && !batch.unsureIfProduced) || s.cl.cfg.disableIdempotency || s.cl.cfg.allowIdempotentProduceCancellation {
 			if err := batch.maybeFailErr(&s.cl.cfg); err != nil {
-				batch.owner.failAllRecords(err)
+				batch.owner.failRecords(err)
 				return
 			}
 		}
@@ -1873,7 +1875,7 @@ func (recBuf *recBuf) bumpRepeatedLoadErr(err error) {
 	)
 
 	if willFail {
-		recBuf.failAllRecords(err)
+		recBuf.failRecords(err)
 	}
 }
 
@@ -1942,6 +1944,93 @@ func (recBuf *recBuf) failAllRecords(err error) {
 	if pid >= 0 {
 		recBuf.cl.failProducerID(pid, epoch, errReloadProducerID)
 	}
+}
+
+// failHeadBatch fails only the head batch and leaves every later batch
+// buffered, so the partition keeps delivering past the failure. It is the
+// IsolateFailedBatches counterpart of failAllRecords, which fails the whole
+// buffer. Must be called with recBuf.mu held; every call site already holds
+// it where failAllRecords was called.
+//
+// Only the head can fail alone. Every caller reaches it through the head
+// (a response for the first batch, or a pre-send check on batches[0]); a
+// stale response whose batch is no longer the head is skipped upstream.
+// Dropping a non-head would leave a sequence gap the drain index cannot
+// represent anyway.
+func (recBuf *recBuf) failHeadBatch(err error) {
+	if len(recBuf.batches) == 0 {
+		return
+	}
+	recBuf.lockedStopLinger()
+	head := recBuf.batches[0]
+
+	// Sequence accounting mirrors what createReq advanced when the head was
+	// staged. A head that was never written kept its pin clear: the broker
+	// has nothing under its sequence, so later batches continue that
+	// sequence and no epoch bump is needed. A pinned head may be on the
+	// broker, so reusing its sequence after dropping it would either
+	// duplicate-silence the next batch inside the old epoch or trip OOOSN;
+	// bumping the epoch and restarting the sequence at zero is the same
+	// recovery failAllRecords uses for a pinned buffer.
+	pinned := head.pinned
+	if pinned {
+		pid, epoch := head.pid, head.epoch
+		recBuf.needSeqReset = true
+		recBuf.cl.failProducerID(pid, epoch, errReloadProducerID)
+	} else {
+		// Rewind the drain cursor to where it was before the head staged:
+		// batch0Seq is the head's first sequence, and every later batch was
+		// numbered relative to it, so they now continue from it unchanged.
+		recBuf.seq = recBuf.batch0Seq
+	}
+
+	head.mu.Lock()
+	records := head.records
+	head.records = nil
+	head.releaseStream()
+	head.mu.Unlock()
+
+	n := len(records)
+	recBuf.buffered.Add(-int64(n))
+	recBuf.batches[0] = nil
+	recBuf.batches = recBuf.batches[1:]
+	// Drain index counts the staged (in-flight) head-first prefix. A head
+	// reached from a pre-send check (tryAddBatch, bumpRepeatedLoadErr) was
+	// never staged, so the index is already zero and must not go negative; a
+	// head reached from a response was staged and owns one count. Staging is
+	// strictly head-first, so index > 0 iff the head was staged.
+	if recBuf.batchDrainIdx > 0 {
+		recBuf.batchDrainIdx--
+	}
+	if len(recBuf.batches) > 0 {
+		// The new head now defines batch0Seq at the cursor fixed above: the
+		// pinned branch restarts at zero on the next staging via
+		// needSeqReset, the unpinned branch continues the head's sequence.
+		recBuf.batch0Seq = recBuf.seq
+	} else {
+		// Nothing left: reset both cursors. The pinned branch additionally
+		// keeps needSeqReset set, but an empty buffer's next first batch
+		// starts at sequence zero regardless.
+		recBuf.seq = 0
+		recBuf.batch0Seq = 0
+	}
+
+	recBuf.cl.producer.promiseBatch(batchPromise{
+		recs: records,
+		err:  err,
+	})
+}
+
+// failRecords dispatches a per-partition produce failure according to the
+// failure-isolation option. Terminal whole-client paths (close, abort, purge,
+// fatal producer-ID failure, abandoned buffers) call failAllRecords directly.
+// Must be called with recBuf.mu held.
+func (recBuf *recBuf) failRecords(err error) {
+	if recBuf.cl.cfg.isolateFailedBatches {
+		recBuf.failHeadBatch(err)
+		return
+	}
+	recBuf.failAllRecords(err)
 }
 
 // clearFailing clears a buffer's failing state if it is failing.
@@ -2306,7 +2395,7 @@ func (p *produceRequest) tryAddBatch(produceVersion int32, recBuf *recBuf, batch
 	if recBuf.batches[0] == batch {
 		if !p.idempotent() || recBuf.cl.cfg.allowIdempotentProduceCancellation || (batch.canFailFromLoadErrs && !batch.unsureIfProduced) {
 			if err := batch.maybeFailErr(&batch.owner.cl.cfg); err != nil {
-				recBuf.failAllRecords(err)
+				recBuf.failRecords(err)
 				return false
 			}
 		}
