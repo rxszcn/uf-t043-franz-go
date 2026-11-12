@@ -1,0 +1,187 @@
+package kfake
+
+import (
+	"maps"
+	"slices"
+	"strconv"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// DescribeConfigs: v0-4
+//
+// Supported resource types:
+// * BROKER (2)
+// * TOPIC (4)
+// * CLIENT_METRICS (16)
+// * GROUP (32)
+//
+// Version notes:
+// * v1: ConfigSynonyms in response
+// * v2: ThrottleMillis
+// * v3: ConfigType and ConfigDocumentation in response
+// * v4: Flexible versions
+
+func init() { regKey(32, 0, 4) }
+
+func (c *Cluster) handleDescribeConfigs(creq *clientReq) (kmsg.Response, error) {
+	var (
+		b    = creq.cc.b
+		req  = creq.kreq.(*kmsg.DescribeConfigsRequest)
+		resp = req.ResponseKind().(*kmsg.DescribeConfigsResponse)
+	)
+
+	if err := c.checkReqVersion(req.Key(), req.Version); err != nil {
+		return nil, err
+	}
+
+	doner := func(n string, t kmsg.ConfigResourceType, errCode int16) *kmsg.DescribeConfigsResponseResource {
+		st := kmsg.NewDescribeConfigsResponseResource()
+		st.ResourceName = n
+		st.ResourceType = t
+		st.ErrorCode = errCode
+		resp.Resources = append(resp.Resources, st)
+		return &resp.Resources[len(resp.Resources)-1]
+	}
+
+	rfn := func(r *kmsg.DescribeConfigsResponseResource) func(k string, v *string, src kmsg.ConfigSource, sensitive bool) {
+		nameIdxs := make(map[string]int)
+		return func(k string, v *string, src kmsg.ConfigSource, sensitive bool) {
+			rc := kmsg.NewDescribeConfigsResponseResourceConfig()
+			rc.Name = k
+			rc.Value = v
+			rc.Source = src
+			rc.ReadOnly = rc.Source == kmsg.ConfigSourceStaticBrokerConfig
+			rc.IsDefault = rc.Source == kmsg.ConfigSourceDefaultConfig || rc.Source == kmsg.ConfigSourceStaticBrokerConfig
+			rc.IsSensitive = sensitive
+			rc.ConfigType = configTypes[k] // v3+: defaults to 0 (UNKNOWN) if not in map
+
+			// We walk configs from static to default to dynamic,
+			// if this config already exists previously, we move
+			// the previous config to a synonym and update the
+			// previous config.
+			if idx, ok := nameIdxs[k]; ok {
+				prior := r.Configs[idx]
+				syn := kmsg.NewDescribeConfigsResponseResourceConfigConfigSynonym()
+				syn.Name = prior.Name
+				syn.Value = prior.Value
+				syn.Source = prior.Source
+				rc.ConfigSynonyms = append([]kmsg.DescribeConfigsResponseResourceConfigConfigSynonym{syn}, prior.ConfigSynonyms...)
+				r.Configs[idx] = rc
+				return
+			}
+			nameIdxs[k] = len(r.Configs)
+			r.Configs = append(r.Configs, rc)
+		}
+	}
+	filter := func(rr *kmsg.DescribeConfigsRequestResource, r *kmsg.DescribeConfigsResponseResource) {
+		if rr.ConfigNames == nil {
+			return
+		}
+		names := make(map[string]struct{})
+		for _, name := range rr.ConfigNames {
+			names[name] = struct{}{}
+		}
+		keep := r.Configs[:0]
+		for _, rc := range r.Configs {
+			if _, ok := names[rc.Name]; ok {
+				keep = append(keep, rc)
+			}
+		}
+		r.Configs = keep
+	}
+
+outer:
+	for i := range req.Resources {
+		rr := &req.Resources[i]
+		switch rr.ResourceType {
+		case kmsg.ConfigResourceTypeBroker:
+			if e := c.denyCluster(creq, kmsg.ACLOperationDescribeConfigs, brokerConfigFaultKey(b, rr.ResourceName)); e != nil {
+				doner(rr.ResourceName, rr.ResourceType, e.Code)
+				continue outer
+			}
+			id := int32(-1)
+			if rr.ResourceName != "" {
+				iid, err := strconv.Atoi(rr.ResourceName)
+				id = int32(iid)
+				if err != nil || id != b.node {
+					doner(rr.ResourceName, rr.ResourceType, kerr.InvalidRequest.Code)
+					continue outer
+				}
+			}
+			r := doner(rr.ResourceName, rr.ResourceType, 0)
+			c.brokerConfigs(id, rfn(r))
+			filter(rr, r)
+
+		case kmsg.ConfigResourceTypeTopic:
+			if e := c.deny(creq, rr.ResourceName, kmsg.ACLResourceTypeTopic, kmsg.ACLOperationDescribeConfigs, faultKey{topic: rr.ResourceName, resource: rr.ResourceName}); e != nil {
+				doner(rr.ResourceName, rr.ResourceType, e.Code)
+				continue
+			}
+			if _, ok := c.data.tps.gett(rr.ResourceName); !ok {
+				doner(rr.ResourceName, rr.ResourceType, kerr.UnknownTopicOrPartition.Code)
+				continue
+			}
+			r := doner(rr.ResourceName, rr.ResourceType, 0)
+			c.data.configs(rr.ResourceName, rfn(r))
+			filter(rr, r)
+
+		case kmsg.ConfigResourceTypeClientMetrics:
+			// A subscription is a cluster resource, like a broker:
+			// DescribeConfigs on CLUSTER. A name with no
+			// subscription answers every key at its default, as
+			// Kafka does; only an empty name is an error.
+			if e := c.denyCluster(creq, kmsg.ACLOperationDescribeConfigs, faultKey{resource: rr.ResourceName}); e != nil {
+				doner(rr.ResourceName, rr.ResourceType, e.Code)
+				continue
+			}
+			if rr.ResourceName == "" {
+				doner(rr.ResourceName, rr.ResourceType, kerr.InvalidRequest.Code)
+				continue
+			}
+			sub := c.clientMetrics[rr.ResourceName]
+			r := doner(rr.ResourceName, rr.ResourceType, 0)
+			emit := rfn(r)
+			for _, k := range slices.Sorted(maps.Keys(validClientMetricsConfigs)) {
+				if v, dynamic := sub[k]; dynamic {
+					emit(k, v, kmsg.ConfigSourceClientMetricsConfig, false)
+					continue
+				}
+				def := validClientMetricsConfigs[k]
+				emit(k, &def, kmsg.ConfigSourceDefaultConfig, false)
+			}
+			filter(rr, r)
+
+		case kmsg.ConfigResourceTypeGroupConfig:
+			if e := c.deny(creq, rr.ResourceName, kmsg.ACLResourceTypeGroup, kmsg.ACLOperationDescribeConfigs, faultKey{group: rr.ResourceName, resource: rr.ResourceName}); e != nil {
+				doner(rr.ResourceName, rr.ResourceType, e.Code)
+				continue
+			}
+			r := doner(rr.ResourceName, rr.ResourceType, 0)
+			emit := rfn(r)
+			for k := range validGroupConfigs {
+				v, dynamic := c.groupConfigs[rr.ResourceName][k]
+				src := kmsg.ConfigSourceDefaultConfig
+				if dynamic {
+					src = kmsg.ConfigSourceGroupConfig
+				}
+				emit(k, v, src, false)
+			}
+			filter(rr, r)
+
+		default:
+			doner(rr.ResourceName, rr.ResourceType, kerr.InvalidRequest.Code)
+		}
+	}
+
+	return resp, nil
+}
+
+// brokerConfigFaultKey is the fault key for a BROKER config resource. A name
+// that is another node's ID is answered INVALID_REQUEST here, so the resource
+// is misrouted.
+func brokerConfigFaultKey(b *broker, name string) faultKey {
+	id, err := strconv.Atoi(name)
+	return faultKey{resource: name, misrouted: name != "" && err == nil && int32(id) != b.node}
+}

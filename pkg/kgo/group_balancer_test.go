@@ -1,0 +1,778 @@
+package kgo
+
+import (
+	"reflect"
+	"testing"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// This simple test hits every branch of cooperative-sticky's adjustCooperative
+// by:
+//
+//  1. having partitions migrating from one member to another
+//  2. having a whole topic migrate from one member to another
+//  3. adding new partitions in the plan (new topic wanted for consuming, or an eager member)
+//  4. completely deleting partitions from the plan (topic no longer wanted for consuming)
+//  5. having a member that is still on eager
+//  6. having two members that think they own the same partitions (similar to KIP-341)
+//
+// Thus while it is an ugly test, it is effective.
+func Test_stickyAdjustCooperative(t *testing.T) {
+	assn := func(in map[string][]int32) []kmsg.ConsumerMemberMetadataOwnedPartition {
+		var ks []kmsg.ConsumerMemberMetadataOwnedPartition
+		for topic, partitions := range in {
+			ks = append(ks, kmsg.ConsumerMemberMetadataOwnedPartition{
+				Topic:      topic,
+				Partitions: partitions,
+			})
+		}
+		return ks
+	}
+
+	b := &ConsumerBalancer{
+		members: []kmsg.JoinGroupResponseMember{
+			{MemberID: "a"},
+			{MemberID: "b"},
+			{MemberID: "c"},
+			{MemberID: "d"},
+		},
+		metadatas: []kmsg.ConsumerMemberMetadata{
+			{OwnedPartitions: assn(map[string][]int32{
+				"t1":      {1, 2, 3, 4},
+				"tmove":   {1, 2},
+				"tdelete": {1, 2},
+			})},
+			{OwnedPartitions: assn(map[string][]int32{
+				"t2": {1, 2, 3},
+			})},
+			{}, // eager member, nothing owned
+			{OwnedPartitions: assn(map[string][]int32{
+				"t1": {1, 2, 3, 4},
+			})},
+		},
+	}
+
+	inPlan := map[string]map[string][]int32{
+		"a": {
+			"t1":   {1, 4},
+			"t2":   {3},
+			"tnew": {1, 2},
+		},
+		"b": {
+			"t2":    {2},
+			"tnew":  {3, 4},
+			"tmove": {1},
+		},
+		"c": {
+			"t1":    {3},
+			"t2":    {1},
+			"tnew":  {5},
+			"tmove": {2},
+		},
+		"d": {
+			"t1": {2},
+		},
+	}
+
+	expPlan := map[string]map[string][]int32{
+		"a": {
+			"t1":   {1, 4},
+			"tnew": {1, 2},
+		},
+		"b": {
+			"t2":   {2},
+			"tnew": {3, 4},
+		},
+		"c": {
+			"tnew": {5},
+		},
+		"d": {
+			"t1": {2},
+		},
+	}
+
+	(&BalancePlan{inPlan}).AdjustCooperative(b)
+
+	if !reflect.DeepEqual(inPlan, expPlan) {
+		t.Errorf("got plan != exp\ngot: %#v\nexp: %#v\n", inPlan, expPlan)
+	}
+}
+
+func TestRangeBalancerRackAware(t *testing.T) {
+	t.Parallel()
+
+	rackA := "rackA"
+	rackB := "rackB"
+
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "A"},
+		{MemberID: "B"},
+	}
+	metadatas := []kmsg.ConsumerMemberMetadata{
+		{Topics: []string{"t1"}, Rack: &rackA},
+		{Topics: []string{"t1"}, Rack: &rackB},
+	}
+
+	rb := &rangeBalancer{}
+	b := &ConsumerBalancer{
+		b:            rb,
+		members:      members,
+		metadatas:    metadatas,
+		topics:       map[string]struct{}{"t1": {}},
+		balanceRacks: true,
+		partitionRacks: map[string][]string{
+			"t1": {"rackA", "rackB", "rackA", "rackB"},
+		},
+	}
+
+	topics := map[string]int32{"t1": 4}
+	plan := rb.Balance(b, topics)
+	bp := plan.(*BalancePlan)
+
+	// With rack-aware, A (rackA) should get rackA partitions (0,2)
+	// and B (rackB) should get rackB partitions (1,3).
+	aParts := bp.plan["A"]["t1"]
+	bParts := bp.plan["B"]["t1"]
+	if len(aParts) != 2 || len(bParts) != 2 {
+		t.Fatalf("expected 2 partitions each, got A=%v B=%v", aParts, bParts)
+	}
+
+	for _, p := range aParts {
+		if b.partitionRacks["t1"][p] != "rackA" {
+			t.Errorf("A (rackA) got non-rackA partition %d", p)
+		}
+	}
+	for _, p := range bParts {
+		if b.partitionRacks["t1"][p] != "rackB" {
+			t.Errorf("B (rackB) got non-rackB partition %d", p)
+		}
+	}
+}
+
+func TestRangeBalancerNoRacks(t *testing.T) {
+	t.Parallel()
+	// Without rack info, range balancer should work as before.
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "A"},
+		{MemberID: "B"},
+	}
+	metadatas := []kmsg.ConsumerMemberMetadata{
+		{Topics: []string{"t1"}},
+		{Topics: []string{"t1"}},
+	}
+
+	rb := &rangeBalancer{}
+	b := &ConsumerBalancer{
+		b:         rb,
+		members:   members,
+		metadatas: metadatas,
+		topics:    map[string]struct{}{"t1": {}},
+	}
+
+	topics := map[string]int32{"t1": 4}
+	plan := rb.Balance(b, topics)
+	bp := plan.(*BalancePlan)
+
+	// Standard range: A gets [0,1], B gets [2,3].
+	aParts := bp.plan["A"]["t1"]
+	bParts := bp.plan["B"]["t1"]
+	if !reflect.DeepEqual(aParts, []int32{0, 1}) {
+		t.Errorf("expected A=[0,1], got %v", aParts)
+	}
+	if !reflect.DeepEqual(bParts, []int32{2, 3}) {
+		t.Errorf("expected B=[2,3], got %v", bParts)
+	}
+}
+
+// rangeBalance is a test helper that builds a ConsumerBalancer and runs the
+// range balancer. Each member is {ID, Topics, Rack} as a simple struct.
+type rangeMember struct {
+	id     string
+	topics []string
+	rack   string // empty means no rack
+}
+
+func rangeBalance(members []rangeMember, topics map[string]int32, partitionRacks map[string][]string) *BalancePlan {
+	rb := &rangeBalancer{}
+	jMembers := make([]kmsg.JoinGroupResponseMember, len(members))
+	metas := make([]kmsg.ConsumerMemberMetadata, len(members))
+	allTopics := make(map[string]struct{})
+	for i, m := range members {
+		jMembers[i] = kmsg.JoinGroupResponseMember{MemberID: m.id}
+		metas[i] = kmsg.ConsumerMemberMetadata{Topics: m.topics}
+		if m.rack != "" {
+			r := m.rack
+			metas[i].Rack = &r
+		}
+		for _, t := range m.topics {
+			allTopics[t] = struct{}{}
+		}
+	}
+	b := &ConsumerBalancer{
+		b:              rb,
+		members:        jMembers,
+		metadatas:      metas,
+		topics:         allTopics,
+		balanceRacks:   true,
+		partitionRacks: partitionRacks,
+	}
+	return rb.Balance(b, topics).(*BalancePlan)
+}
+
+func TestRangeBalancerRackNoMatchingRacks(t *testing.T) {
+	t.Parallel()
+	// Partition racks don't match any consumer rack: phase 1 assigns
+	// nothing, phase 2 does standard range.
+	members := []rangeMember{
+		{"A", []string{"t1"}, "rackX"},
+		{"B", []string{"t1"}, "rackY"},
+	}
+	bp := rangeBalance(members, map[string]int32{"t1": 4}, map[string][]string{
+		"t1": {"rackA", "rackB", "rackA", "rackB"},
+	})
+
+	// Falls through to standard range: A=[0,1], B=[2,3].
+	if !reflect.DeepEqual(bp.plan["A"]["t1"], []int32{0, 1}) {
+		t.Errorf("A: want [0,1], got %v", bp.plan["A"]["t1"])
+	}
+	if !reflect.DeepEqual(bp.plan["B"]["t1"], []int32{2, 3}) {
+		t.Errorf("B: want [2,3], got %v", bp.plan["B"]["t1"])
+	}
+}
+
+func TestRangeBalancerRackMixedMemberRacks(t *testing.T) {
+	t.Parallel()
+	// A has a rack, B has no rack. Phase 1 assigns rack-matched
+	// partitions to A up to quota. B gets remainder in phase 2.
+	members := []rangeMember{
+		{"A", []string{"t1"}, "rackA"},
+		{"B", []string{"t1"}, ""},
+	}
+	bp := rangeBalance(members, map[string]int32{"t1": 4}, map[string][]string{
+		"t1": {"rackA", "rackB", "rackA", "rackB"},
+	})
+
+	// A's quota is 2. Phase 1: A gets p0(rackA), p2(rackA) = 2.
+	// Phase 2: B gets p1, p3 (the unassigned ones).
+	aParts := bp.plan["A"]["t1"]
+	bParts := bp.plan["B"]["t1"]
+	if len(aParts) != 2 || len(bParts) != 2 {
+		t.Fatalf("want 2 each, got A=%v B=%v", aParts, bParts)
+	}
+	// A should have the rackA partitions (0 and 2).
+	for _, p := range aParts {
+		rack := map[string][]string{"t1": {"rackA", "rackB", "rackA", "rackB"}}["t1"][p]
+		if rack != "rackA" {
+			t.Errorf("A(rackA) got partition %d with rack %s", p, rack)
+		}
+	}
+}
+
+func TestRangeBalancerRackShortRackSlice(t *testing.T) {
+	t.Parallel()
+	// partitionRacks has fewer entries than the actual partition count.
+	// Partitions beyond the rack slice should fall through to phase 2.
+	members := []rangeMember{
+		{"A", []string{"t1"}, "rackA"},
+		{"B", []string{"t1"}, "rackB"},
+	}
+	bp := rangeBalance(members, map[string]int32{"t1": 6}, map[string][]string{
+		"t1": {"rackA", "rackB"}, // only 2 entries for 6 partitions
+	})
+
+	// Phase 1: A gets p0(rackA), B gets p1(rackB). Each has 1/3 quota used.
+	// Phase 2: remaining 4 partitions distributed by range.
+	// A quota=3, used=1, needs 2 more. B quota=3, used=1, needs 2 more.
+	aTotal := len(bp.plan["A"]["t1"])
+	bTotal := len(bp.plan["B"]["t1"])
+	if aTotal != 3 || bTotal != 3 {
+		t.Errorf("want A=3 B=3, got A=%d B=%d", aTotal, bTotal)
+	}
+}
+
+func TestRangeBalancerRackOddPartitions(t *testing.T) {
+	t.Parallel()
+	// 5 partitions, 2 consumers: div=2, rem=1. First consumer gets 3.
+	// With racks: the remainder partition should still respect range order.
+	members := []rangeMember{
+		{"A", []string{"t1"}, "rackA"},
+		{"B", []string{"t1"}, "rackB"},
+	}
+	bp := rangeBalance(members, map[string]int32{"t1": 5}, map[string][]string{
+		"t1": {"rackA", "rackB", "rackA", "rackB", "rackA"},
+	})
+
+	// A(rackA) quota=3: phase 1 grabs p0,p2,p4 (all rackA). Done.
+	// B(rackB) quota=2: phase 1 grabs p1,p3 (both rackB). Done.
+	aParts := bp.plan["A"]["t1"]
+	bParts := bp.plan["B"]["t1"]
+	if len(aParts) != 3 || len(bParts) != 2 {
+		t.Fatalf("want A=3 B=2, got A=%v B=%v", aParts, bParts)
+	}
+}
+
+func TestRangeBalancerRackMultiTopicDisjoint(t *testing.T) {
+	t.Parallel()
+	// Two topics with different subscriptions and different rack layouts.
+	// t1: A,B subscribe; all partitions rackA.
+	// t2: B,C subscribe; all partitions rackB.
+	members := []rangeMember{
+		{"A", []string{"t1"}, "rackA"},
+		{"B", []string{"t1", "t2"}, "rackB"},
+		{"C", []string{"t2"}, "rackA"},
+	}
+	bp := rangeBalance(members,
+		map[string]int32{"t1": 4, "t2": 4},
+		map[string][]string{
+			"t1": {"rackA", "rackA", "rackA", "rackA"},
+			"t2": {"rackB", "rackB", "rackB", "rackB"},
+		},
+	)
+
+	// t1: A(rackA) quota=2, gets p0,p1 via phase 1. B(rackB) quota=2,
+	//     no rack match in phase 1, gets p2,p3 via phase 2.
+	// t2: B(rackB) quota=2, gets p0,p1 via phase 1. C(rackA) quota=2,
+	//     no rack match, gets p2,p3 via phase 2.
+	if len(bp.plan["A"]["t1"]) != 2 {
+		t.Errorf("A t1: want 2, got %v", bp.plan["A"]["t1"])
+	}
+	if len(bp.plan["B"]["t1"]) != 2 {
+		t.Errorf("B t1: want 2, got %v", bp.plan["B"]["t1"])
+	}
+	if len(bp.plan["B"]["t2"]) != 2 {
+		t.Errorf("B t2: want 2, got %v", bp.plan["B"]["t2"])
+	}
+	if len(bp.plan["C"]["t2"]) != 2 {
+		t.Errorf("C t2: want 2, got %v", bp.plan["C"]["t2"])
+	}
+}
+
+func TestNewConsumerBalancerIssue493(t *testing.T) {
+	m := kmsg.NewConsumerMemberMetadata()
+	m.Version = 0
+	m.Topics = []string{"foo"}
+	protoMeta := m.AppendTo(nil)
+	protoMeta[1] = 1
+	member := kmsg.NewJoinGroupResponseMember()
+	member.MemberID = "test"
+	member.ProtocolMetadata = protoMeta
+	_, err := NewConsumerBalancer(nil, []kmsg.JoinGroupResponseMember{member})
+	if err != nil {
+		t.Errorf("got unexpected error: %v", err)
+	}
+}
+
+// A cooperative plan must never hand a partition to a member whose ownership
+// claim is stale (a strictly higher-generation claim exists elsewhere): the
+// current owner is still consuming it, and skipping the revoke round means
+// two members consume the partition simultaneously. The stale claimant's own
+// OwnedPartitions must not mask the transfer.
+func TestAdjustCooperativeStaleClaimIsTransfer(t *testing.T) {
+	t.Parallel()
+
+	mkMeta := func(gen int32, owned map[string][]int32) []byte {
+		meta := kmsg.NewConsumerMemberMetadata()
+		meta.Version = 3
+		meta.Topics = []string{"t"}
+		meta.Generation = gen
+		for topic, parts := range owned {
+			op := kmsg.NewConsumerMemberMetadataOwnedPartition()
+			op.Topic = topic
+			op.Partitions = parts
+			meta.OwnedPartitions = append(meta.OwnedPartitions, op)
+		}
+		return meta.AppendTo(nil)
+	}
+
+	// a claims t/0 from generation 1; b claims t/0,1,2 from generation 2.
+	// Sticky's resticky pass deliberately moves t/0 back to the lighter a,
+	// which is fine for eager but must be a two-phase transfer when
+	// cooperative: b revokes first, a gets it next round.
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "a", ProtocolMetadata: mkMeta(1, map[string][]int32{"t": {0}})},
+		{MemberID: "b", ProtocolMetadata: mkMeta(2, map[string][]int32{"t": {0, 1, 2}})},
+	}
+
+	gb, _, err := CooperativeStickyBalancer().MemberBalancer(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	into, err := gb.(GroupMemberBalancerOrError).BalanceOrError(map[string]int32{"t": 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := into.(*BalancePlan).AsMemberIDMap()
+
+	for member, topics := range plan {
+		for _, p := range topics["t"] {
+			if p == 0 {
+				t.Errorf("t/0 assigned to %s while generation-2 owner b has not yet revoked it", member)
+			}
+		}
+	}
+	if got := plan["b"]["t"]; len(got) != 2 {
+		t.Errorf("expected b to keep two partitions, got %v", got)
+	}
+}
+
+// Member metadata that fails to parse (and is not the #493 buggy-v1 shape)
+// must surface an error rather than balancing with whatever prefix parsed:
+// a truncated Topics array leaves phantom "" topics behind.
+func TestNewConsumerBalancerMalformedMetadataErrors(t *testing.T) {
+	t.Parallel()
+
+	// v0, Topics array claims two strings, only one present.
+	bad := []byte{0, 0, 0, 0, 0, 2, 0, 1, 'a'}
+	_, err := NewConsumerBalancer(new(roundRobinBalancer), []kmsg.JoinGroupResponseMember{
+		{MemberID: "m", ProtocolMetadata: bad},
+	})
+	if err == nil {
+		t.Error("expected an error for truncated member metadata, got nil")
+	}
+}
+
+// A buggy or hostile broker can list the same member twice in one JoinGroup
+// response. The sticky engine balances list entries independently but keys
+// its returned plan by member ID, so without deduplication the duplicate's
+// partitions overwrite each other and some partitions are assigned to nobody.
+func TestNewConsumerBalancerDuplicateMemberIDs(t *testing.T) {
+	t.Parallel()
+
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "a", ProtocolMetadata: simpleMemberMetadata([]string{"t"}, 0)},
+		{MemberID: "a", ProtocolMetadata: simpleMemberMetadata([]string{"t"}, 0)},
+	}
+
+	gb, _, err := StickyBalancer().MemberBalancer(members)
+	if err != nil {
+		t.Fatal(err)
+	}
+	into, err := gb.(GroupMemberBalancerOrError).BalanceOrError(map[string]int32{"t": 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan := into.(*BalancePlan).AsMemberIDMap()
+
+	var total int
+	for _, topics := range plan {
+		total += len(topics["t"])
+	}
+	if total != 2 {
+		t.Errorf("expected 2 partitions assigned, got %d (plan %v)", total, plan)
+	}
+}
+
+// TestBuildPartitionRacks checks that partition racks come from the metadata
+// cache, which has every topic the group is interested in, including topics
+// we do not ourselves consume, and that our own topics still get racks when
+// the cache has been pruned.
+func TestBuildPartitionRacks(t *testing.T) {
+	t.Parallel()
+
+	rackA := "rackA"
+	cl := new(Client)
+	cl.brokers = []*broker{
+		{meta: BrokerMetadata{NodeID: 1, Rack: &rackA}},
+		{meta: BrokerMetadata{NodeID: 2}},
+	}
+	cl.metaCache.topics = map[string]cachedMetaTopic{
+		"t1": {t: kmsg.MetadataResponseTopic{Partitions: []kmsg.MetadataResponseTopicPartition{
+			{Partition: 0, Leader: 1},
+		}}},
+		// A topic another member is interested in: the cache keeps the
+		// broker's response order, and can know of more partitions than
+		// the group is balancing.
+		"t2": {t: kmsg.MetadataResponseTopic{Partitions: []kmsg.MetadataResponseTopicPartition{
+			{Partition: 1, Leader: 1},
+			{Partition: 0, Leader: 2},
+			{Partition: 2, Leader: 1},
+		}}},
+	}
+
+	// t4 is ours and has been pruned from the cache.
+	tps := newTopicsPartitions()
+	tps.storeTopics([]string{"t4"})
+	tps.load()["t4"].v.Store(&topicPartitionsData{partitions: []*topicPartition{
+		{topicPartitionData: topicPartitionData{leader: 1}},
+	}})
+
+	g := &groupConsumer{cl: cl, tps: tps}
+	b := &ConsumerBalancer{
+		metadatas: []kmsg.ConsumerMemberMetadata{{Topics: []string{"t1"}, Rack: &rackA}},
+	}
+
+	// Broker 2 has no rack, and t3 is in neither the cache nor tps: both
+	// are rackless rather than missing.
+	got := g.buildPartitionRacks(b, map[string]int32{"t1": 1, "t2": 2, "t3": 1, "t4": 1})
+	exp := map[string][]string{
+		"t1": {"rackA"},
+		"t2": {"", "rackA"},
+		"t3": {""},
+		"t4": {"rackA"},
+	}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("got racks != exp\ngot: %#v\nexp: %#v\n", got, exp)
+	}
+}
+
+func TestNeedRackMeta(t *testing.T) {
+	t.Parallel()
+
+	rack := "rack"
+	// t1 is ours, t2 is a topic only another member consumes.
+	topics := map[string]struct{}{"t1": {}, "t2": {}}
+	rackB := &ConsumerBalancer{metadatas: []kmsg.ConsumerMemberMetadata{{Topics: []string{"t1"}, Rack: &rack}}}
+	norackB := &ConsumerBalancer{metadatas: []kmsg.ConsumerMemberMetadata{{Topics: []string{"t1"}}}}
+
+	newG := func(cached ...string) *groupConsumer {
+		cl := new(Client)
+		cl.metaCache.topics = make(map[string]cachedMetaTopic)
+		for _, topic := range cached {
+			cl.metaCache.topics[topic] = cachedMetaTopic{}
+		}
+		tps := newTopicsPartitions()
+		tps.storeTopics([]string{"t1"})
+		return &groupConsumer{cl: cl, cfg: &cl.cfg, tps: tps}
+	}
+
+	for _, test := range []struct {
+		name string
+		g    *groupConsumer
+		b    GroupMemberBalancer
+		exp  bool
+	}{
+		{"cache is missing a topic that is not ours", newG("t1"), rackB, true},
+		{"cache has every topic", newG("t1", "t2"), rackB, false},
+		{"cache is missing only our own topic", newG("t2"), rackB, false},
+		{"no member has a rack", newG("t1"), norackB, false},
+	} {
+		if got := test.g.needRackMeta(test.b, topics); got != test.exp {
+			t.Errorf("%s: got %v, expected %v", test.name, got, test.exp)
+		}
+	}
+}
+
+var _ GroupMemberBalancerInfo = new(ConsumerBalancer)
+
+// balanceFn adapts a func to ConsumerBalancerBalance for tests.
+type balanceFn func(*ConsumerBalancer, map[string]int32) IntoSyncAssignment
+
+func (f balanceFn) Balance(b *ConsumerBalancer, topics map[string]int32) IntoSyncAssignment {
+	return f(b, topics)
+}
+
+func TestConsumerBalancerInfo(t *testing.T) {
+	t.Parallel()
+
+	members := []kmsg.JoinGroupResponseMember{
+		{MemberID: "a", ProtocolMetadata: simpleMemberMetadata([]string{"t1"}, 0)},
+		{MemberID: "b", ProtocolMetadata: simpleMemberMetadata([]string{"t1"}, 0)},
+	}
+
+	var seen BalanceInfo
+	b, err := NewConsumerBalancer(balanceFn(func(b *ConsumerBalancer, _ map[string]int32) IntoSyncAssignment {
+		seen = b.Info()
+		return b.NewPlan()
+	}), members)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Without SetBalanceInfo (NewConsumerBalancer without a client), Info
+	// is empty and the functions return nil rather than being nil.
+	if info := b.Info(); info.Group != "" || info.Generation != 0 || info.LeaderID != "" || info.Topics() != nil || info.Brokers() != nil {
+		t.Errorf("got non-empty info %+v before SetBalanceInfo", info)
+	}
+
+	expTopics := map[string]TopicMetadata{"t1": {Topic: "t1"}}
+	expBrokers := map[int32]BrokerMetadata{1: {NodeID: 1}}
+	b.SetBalanceInfo(BalanceInfo{
+		Group:      "g",
+		Generation: 2,
+		LeaderID:   "b",
+		Topics:     func() map[string]TopicMetadata { return expTopics },
+		Brokers:    func() map[int32]BrokerMetadata { return expBrokers },
+	})
+
+	// The info set must be exactly what Balance observes through Info.
+	if _, err := b.BalanceOrError(map[string]int32{"t1": 1}); err != nil {
+		t.Fatal(err)
+	}
+	if seen.Group != "g" || seen.Generation != 2 || seen.LeaderID != "b" {
+		t.Errorf("got info %+v in balance, expected group g, generation 2, leader b", seen)
+	}
+	if !reflect.DeepEqual(seen.Topics(), expTopics) || !reflect.DeepEqual(seen.Brokers(), expBrokers) {
+		t.Errorf("got topics %+v brokers %+v in balance, expected %+v and %+v", seen.Topics(), seen.Brokers(), expTopics, expBrokers)
+	}
+}
+
+func TestBalanceInfoTopics(t *testing.T) {
+	t.Parallel()
+
+	cl := new(Client)
+	cl.metaCache.topics = map[string]cachedMetaTopic{
+		"t1": {
+			id: [16]byte{1},
+			t: kmsg.MetadataResponseTopic{
+				// Deliberately out of partition order: the cache
+				// keeps the broker's response order, the snapshot
+				// promises partition order.
+				Partitions: []kmsg.MetadataResponseTopicPartition{
+					{
+						Partition:       1,
+						Leader:          2,
+						LeaderEpoch:     5,
+						Replicas:        []int32{2, 3},
+						ISR:             []int32{2},
+						OfflineReplicas: []int32{3},
+					},
+					{
+						Partition:   0,
+						Leader:      3,
+						LeaderEpoch: 4,
+						Replicas:    []int32{3, 2},
+						ISR:         []int32{3, 2},
+						ErrorCode:   kerr.NotLeaderForPartition.Code,
+					},
+				},
+			},
+		},
+		"terr":   {t: kmsg.MetadataResponseTopic{ErrorCode: kerr.UnknownTopicOrPartition.Code}},
+		"tother": {}, // cached but not being balanced: must not appear
+	}
+
+	// tmissing is being balanced but is not in the cache: must be missing.
+	got := cl.balanceInfoTopics(map[string]struct{}{"t1": {}, "terr": {}, "tmissing": {}})
+	exp := map[string]TopicMetadata{
+		"t1": {
+			Topic: "t1",
+			ID:    [16]byte{1},
+			Partitions: []PartitionMetadata{
+				{Topic: "t1", Partition: 0, Leader: 3, LeaderEpoch: 4, Replicas: []int32{3, 2}, ISR: []int32{3, 2}, Err: kerr.NotLeaderForPartition},
+				{Topic: "t1", Partition: 1, Leader: 2, LeaderEpoch: 5, Replicas: []int32{2, 3}, ISR: []int32{2}, OfflineReplicas: []int32{3}},
+			},
+		},
+		"terr": {Topic: "terr", Partitions: []PartitionMetadata{}, Err: kerr.UnknownTopicOrPartition},
+	}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("got topics != exp\ngot: %#v\nexp: %#v\n", got, exp)
+	}
+
+	// The snapshot is deep copied: mutating it must not corrupt the cache.
+	got["t1"].Partitions[1].Replicas[0] = 99
+	if r := cl.metaCache.topics["t1"].t.Partitions[0].Replicas[0]; r != 2 {
+		t.Errorf("mutating snapshot changed cached replica to %d", r)
+	}
+}
+
+func TestBalanceInfoBrokers(t *testing.T) {
+	t.Parallel()
+
+	rack := "rack1"
+	cl := new(Client)
+	cl.brokers = []*broker{
+		{meta: BrokerMetadata{NodeID: 1, Host: "h1", Port: 9092, Rack: &rack}},
+		{meta: BrokerMetadata{NodeID: 2, Host: "h2", Port: 9092}},
+	}
+
+	got := cl.balanceInfoBrokers()
+	exp := map[int32]BrokerMetadata{
+		1: {NodeID: 1, Host: "h1", Port: 9092, Rack: &rack},
+		2: {NodeID: 2, Host: "h2", Port: 9092},
+	}
+	if !reflect.DeepEqual(got, exp) {
+		t.Errorf("got brokers != exp\ngot: %#v\nexp: %#v\n", got, exp)
+	}
+}
+
+// infoGroupBalancer is a GroupBalancer whose balance callback receives the
+// ConsumerBalancer, for testing the info that balanceGroup sets.
+type infoGroupBalancer struct {
+	onBalance func(*ConsumerBalancer)
+}
+
+func (*infoGroupBalancer) ProtocolName() string { return "test-info" }
+func (*infoGroupBalancer) IsCooperative() bool  { return false }
+func (*infoGroupBalancer) JoinGroupMetadata(interests []string, _ map[string][]int32, generation int32) []byte {
+	return simpleMemberMetadata(interests, generation)
+}
+
+func (*infoGroupBalancer) ParseSyncAssignment(assignment []byte) (map[string][]int32, error) {
+	return ParseConsumerSyncAssignment(assignment)
+}
+
+func (ib *infoGroupBalancer) MemberBalancer(members []kmsg.JoinGroupResponseMember) (GroupMemberBalancer, map[string]struct{}, error) {
+	b, err := NewConsumerBalancer(balanceFn(func(b *ConsumerBalancer, _ map[string]int32) IntoSyncAssignment {
+		ib.onBalance(b)
+		return b.NewPlan()
+	}), members)
+	return b, b.MemberTopics(), err
+}
+
+// TestBalanceGroupSetsBalanceInfo drives balanceGroup itself -- no network is
+// needed when the group's topics are already in tps -- to test the info the
+// client sets before balancing, including that the Topics and Brokers
+// snapshots are built once and memoized.
+func TestBalanceGroupSetsBalanceInfo(t *testing.T) {
+	t.Parallel()
+
+	cl := new(Client)
+	cl.cfg.logger = new(nopLogger)
+	cl.cfg.group = "g"
+	cl.metaCache.topics = map[string]cachedMetaTopic{
+		"t1": {t: kmsg.MetadataResponseTopic{
+			Partitions: []kmsg.MetadataResponseTopicPartition{{Partition: 0, Leader: 1}},
+		}},
+	}
+	cl.brokers = []*broker{{meta: BrokerMetadata{NodeID: 1, Host: "h1", Port: 9092}}}
+
+	var balanced bool
+	gb := &infoGroupBalancer{onBalance: func(b *ConsumerBalancer) {
+		balanced = true
+		info := b.Info()
+		if info.Group != "g" || info.Generation != 7 || info.LeaderID != "b" {
+			t.Errorf("got info %+v, expected group g, generation 7, leader b", info)
+		}
+
+		topics, brokers := info.Topics(), info.Brokers()
+		if len(topics) != 1 || len(topics["t1"].Partitions) != 1 || topics["t1"].Partitions[0].Leader != 1 {
+			t.Errorf("got topics %+v, expected t1 with partition 0 led by broker 1", topics)
+		}
+		if len(brokers) != 1 || brokers[1].Host != "h1" {
+			t.Errorf("got brokers %+v, expected broker 1 on h1", brokers)
+		}
+
+		// The first call builds the result, later calls return the
+		// same map: wiping what the snapshots are built from must
+		// change nothing.
+		cl.metaCache.topics = nil
+		cl.brokers = nil
+		if reflect.ValueOf(info.Topics()).Pointer() != reflect.ValueOf(topics).Pointer() {
+			t.Error("second Topics call did not return the memoized map")
+		}
+		if reflect.ValueOf(info.Brokers()).Pointer() != reflect.ValueOf(brokers).Pointer() {
+			t.Error("second Brokers call did not return the memoized map")
+		}
+	}}
+	cl.cfg.balancers = []GroupBalancer{gb}
+
+	g := &groupConsumer{cl: cl, cfg: &cl.cfg, tps: newTopicsPartitions()}
+	g.tps.storeTopics([]string{"t1"})
+
+	resp := &kmsg.JoinGroupResponse{
+		Generation: 7,
+		LeaderID:   "b",
+		Members: []kmsg.JoinGroupResponseMember{
+			{MemberID: "a", ProtocolMetadata: simpleMemberMetadata([]string{"t1"}, 0)},
+			{MemberID: "b", ProtocolMetadata: simpleMemberMetadata([]string{"t1"}, 0)},
+		},
+	}
+	if _, err := g.balanceGroup("test-info", resp); err != nil {
+		t.Fatal(err)
+	}
+	if !balanced {
+		t.Fatal("balance was never invoked")
+	}
+}

@@ -1,0 +1,459 @@
+package kgo
+
+import (
+	"context"
+	"encoding/base64"
+	"errors"
+	"fmt"
+	"reflect"
+	"strconv"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kmsg"
+	"github.com/twmb/franz-go/pkg/sasl/oauth"
+	"github.com/twmb/franz-go/pkg/sasl/scram"
+)
+
+func TestMaxVersions(t *testing.T) {
+	if ours, main := new(fetchRequest).MaxVersion(), new(kmsg.FetchRequest).MaxVersion(); ours != main {
+		t.Errorf("our fetch request max version %d != kmsg's %d", ours, main)
+	}
+	if got := (&produceRequest{produceMax: 99}).MaxVersion(); got != 99 {
+		t.Errorf("produceRequest.MaxVersion did not return produceMax: got %d, want 99", got)
+	}
+}
+
+func TestParseBrokerAddr(t *testing.T) {
+	tests := []struct {
+		name     string
+		addr     string
+		expected hostport
+	}{
+		{
+			"IPv4",
+			"127.0.0.1:1234",
+			hostport{"127.0.0.1", 1234},
+		},
+		{
+			"IPv4 + default port",
+			"127.0.0.1",
+			hostport{"127.0.0.1", 9092},
+		},
+		{
+			"host",
+			"localhost:1234",
+			hostport{"localhost", 1234},
+		},
+		{
+			"host + default port",
+			"localhost",
+			hostport{"localhost", 9092},
+		},
+		{
+			"IPv6",
+			"[2001:1000:2000::1]:1234",
+			hostport{"2001:1000:2000::1", 1234},
+		},
+		{
+			"IPv6 + default port",
+			"[2001:1000:2000::1]",
+			hostport{"2001:1000:2000::1", 9092},
+		},
+		{
+			"IPv6 literal",
+			"::1",
+			hostport{"::1", 9092},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := parseBrokerAddr(test.addr)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result != test.expected {
+				t.Fatalf("expected %v, got %v", test.expected, result)
+			}
+		})
+	}
+}
+
+func TestParseBrokerAddrErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		addr string
+	}{
+		{
+			"IPv4 invalid port",
+			"127.0.0.1:foo",
+		},
+		{
+			"host invalid port",
+			"localhost:foo",
+		},
+
+		{
+			"IPv6 invalid port",
+			"[2001:1000:2000::1]:foo",
+		},
+		{
+			"IPv6 missing closing bracket",
+			"[2001:1000:2000::1:1234",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseBrokerAddr(test.addr)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+func TestUnknownGroupOffsetFetchPinned(t *testing.T) {
+	req := kmsg.NewOffsetFetchRequest()
+	req.Group = "unknown-" + strconv.FormatInt(time.Now().UnixNano(), 10)
+
+	cl, _ := newTestClient()
+	defer cl.Close()
+	defer func() {
+		if err := recover(); err != nil {
+			t.Errorf("fetch panicked: %v", err)
+		}
+	}()
+	req.RequestWith(context.Background(), cl)
+}
+
+func TestProcessHooks(t *testing.T) {
+	var (
+		aHook     = Hook(&someHook{index: 10})
+		xs        = []Hook{&someHook{index: 1}, &someHook{index: 2}}
+		ys        = []Hook{&someHook{index: 3}, &someHook{index: 4}, &someHook{index: 5}}
+		all       = append(append(xs, ys...), aHook)
+		sliceHook = new(intSliceHook)
+	)
+
+	tests := []struct {
+		name     string
+		hooks    []Hook
+		expected []Hook
+	}{
+		{
+			name:     "all",
+			hooks:    all,
+			expected: all,
+		},
+		{
+			name:     "nested slice",
+			hooks:    []Hook{all},
+			expected: all,
+		},
+		{
+			name:     "hooks and slices",
+			hooks:    []Hook{xs, ys, aHook},
+			expected: all,
+		},
+		{
+			name:     "slice that implements a hook",
+			hooks:    []Hook{sliceHook},
+			expected: []Hook{sliceHook},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			hooks, err := processHooks(test.hooks)
+			if err != nil {
+				t.Fatal("expected no error", err)
+			}
+			if !reflect.DeepEqual(hooks, test.expected) {
+				t.Fatalf("didn't get expected hooks back after processing, %+v, %+v", hooks, test.expected)
+			}
+		})
+	}
+}
+
+func TestProcessHooksErrors(t *testing.T) {
+	tests := []struct {
+		name  string
+		hooks []Hook
+	}{
+		{
+			name:  "useless slice",
+			hooks: []Hook{&[]int{}},
+		},
+		{
+			name:  "deep useless slice",
+			hooks: []Hook{[]Hook{&[]int{}}},
+		},
+		{
+			name:  "mixed useful and useless",
+			hooks: []Hook{&someHook{}, &notAHook{}},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := processHooks(test.hooks)
+			if err == nil {
+				t.Fatal("expected error")
+			}
+		})
+	}
+}
+
+type notAHook struct{}
+
+type someHook struct {
+	index int
+}
+
+type pollStartHook struct{}
+
+func (*pollStartHook) OnPollStart(_ context.Context) {}
+
+func TestHookPollStartRecognized(t *testing.T) {
+	h := &pollStartHook{}
+	if !implementsAnyHook(h) {
+		t.Fatal("HookPollStart implementor not recognized by implementsAnyHook")
+	}
+	hooks, err := processHooks([]Hook{h})
+	if err != nil {
+		t.Fatal("unexpected error from processHooks:", err)
+	}
+	if len(hooks) != 1 || hooks[0] != h {
+		t.Fatalf("expected hook to pass through processHooks unchanged, got %+v", hooks)
+	}
+}
+
+func (*someHook) OnNewClient(*Client) {
+	// ignore
+}
+
+type intSliceHook []int
+
+func (*intSliceHook) OnNewClient(*Client) {
+	// ignore
+}
+
+func TestPing(t *testing.T) {
+	t.Parallel()
+
+	cl, _ := newTestClient()
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	err := cl.Ping(ctx)
+	if err != nil {
+		t.Errorf("unable to ping: %v", err)
+	}
+}
+
+func TestIssue1034(t *testing.T) {
+	t.Parallel()
+
+	cl, _ := newTestClient()
+	defer cl.Close()
+
+	req := kmsg.NewPtrFindCoordinatorRequest()
+	req.CoordinatorType = 0
+	req.CoordinatorKeys = []string{"foo", "bar", "biz"}
+	resp, err := req.RequestWith(context.Background(), cl)
+	if err != nil {
+		t.Fatalf("unable to request coordinators: %v", err)
+	}
+	need := make(map[string]struct{})
+	for _, k := range req.CoordinatorKeys {
+		need[k] = struct{}{}
+	}
+	for _, c := range resp.Coordinators {
+		if c.Key == "" {
+			t.Errorf("response coordinator erroneously has an empty key")
+			continue
+		}
+		delete(need, c.Key)
+	}
+	if len(need) > 0 {
+		t.Errorf("coordinator key responses missing: %v", need)
+	}
+}
+
+// TestSCRAMAuth tests SCRAM-SHA-256 authentication against a Kafka broker.
+// This test requires KGO_TEST_SCRAM_SEEDS and KGO_TEST_SCRAM environment
+// variables to be set, pointing to a SASL-enabled listener and credentials.
+func TestSCRAMAuth(t *testing.T) {
+	t.Parallel()
+
+	if scramSeeds == "" || saslScram == nil {
+		t.Skip("KGO_TEST_SCRAM_SEEDS or KGO_TEST_SCRAM not set, skipping SCRAM test")
+	}
+
+	// Create a client with SCRAM authentication
+	cl, err := NewClient(
+		SeedBrokers(strings.Split(scramSeeds, ",")...),
+		SASL(saslScram),
+	)
+	if err != nil {
+		t.Fatalf("unable to create SCRAM client: %v", err)
+	}
+	defer cl.Close()
+
+	// Verify connection works by pinging
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := cl.Ping(ctx); err != nil {
+		t.Fatalf("unable to ping with SCRAM auth: %v", err)
+	}
+
+	// Also verify we can perform a metadata request
+	req := kmsg.NewPtrMetadataRequest()
+	resp, err := req.RequestWith(ctx, cl)
+	if err != nil {
+		t.Fatalf("unable to request metadata with SCRAM auth: %v", err)
+	}
+	if len(resp.Brokers) == 0 {
+		t.Error("expected at least one broker in metadata response")
+	}
+}
+
+// TestSCRAMAuthBadCredentials verifies that bad credentials fail authentication.
+func TestSCRAMAuthBadCredentials(t *testing.T) {
+	t.Parallel()
+
+	if scramSeeds == "" {
+		t.Skip("KGO_TEST_SCRAM_SEEDS not set, skipping SCRAM bad credentials test")
+	}
+
+	// Create a client with incorrect SCRAM credentials
+	badAuth := scram.Auth{
+		User: "nonexistent",
+		Pass: "wrongpassword",
+	}
+	cl, err := NewClient(
+		SeedBrokers(strings.Split(scramSeeds, ",")...),
+		SASL(badAuth.AsSha256Mechanism()),
+	)
+	if err != nil {
+		t.Fatalf("unable to create client: %v", err)
+	}
+	defer cl.Close()
+
+	// Ping should fail due to authentication error
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err = cl.Ping(ctx)
+	if err == nil {
+		t.Fatal("expected authentication error with bad credentials, got nil")
+	}
+	// The error should indicate authentication failure
+	t.Logf("got expected error with bad credentials: %v", err)
+}
+
+// Ensure OAUTHBEARER authenticates, and that a rejected token fails with the
+// broker's reason.
+func TestOAuthAuth(t *testing.T) {
+	t.Parallel()
+
+	if oauthSeeds == "" {
+		t.Skip("KGO_TEST_OAUTH_SEEDS not set, skipping OAUTHBEARER test")
+	}
+
+	ping := func(exp time.Time) error {
+		// An unsecured JWS: a {"alg":"none"} header, the claims, and
+		// an empty signature.
+		enc := base64.RawURLEncoding.EncodeToString
+		claims := fmt.Sprintf(`{"sub":"admin","exp":%d}`, exp.Unix())
+		auth := oauth.Auth{Token: enc([]byte(`{"alg":"none"}`)) + "." + enc([]byte(claims)) + "."}
+		cl, err := NewClient(
+			SeedBrokers(strings.Split(oauthSeeds, ",")...),
+			SASL(auth.AsMechanism()),
+		)
+		if err != nil {
+			t.Fatalf("unable to create client: %v", err)
+		}
+		defer cl.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		return cl.Ping(ctx)
+	}
+
+	if err := ping(time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("unable to ping: %v", err)
+	}
+	err := ping(time.Now().Add(-time.Minute))
+	if !errors.Is(err, kerr.SaslAuthenticationFailed) || !strings.Contains(err.Error(), "invalid_token") {
+		t.Fatalf("expired token: got %v, expected SASL_AUTHENTICATION_FAILED with invalid_token", err)
+	}
+}
+
+func TestShareGroup(t *testing.T) {
+	t.Parallel()
+	adm() // ensure allowShare is initialized
+	if !allowShare {
+		t.Skip("broker does not support share groups (requires ShareFetch v2 and ShareAcknowledge v2, Kafka 4.2+)")
+	}
+
+	const totalRecords = 200
+
+	topic, topicCleanup := tmpTopicPartitions(t, 1)
+	defer topicCleanup()
+	group, groupCleanup := tmpShareGroup(t)
+	defer groupCleanup()
+
+	admin, _ := newTestClient(DefaultProduceTopic(topic), UnknownTopicRetries(-1))
+	defer admin.Close()
+	setShareAutoOffsetReset(t, admin, group)
+
+	for i := range totalRecords {
+		admin.Produce(context.Background(), StringRecord(strconv.Itoa(i)), func(_ *Record, err error) {
+			if err != nil {
+				t.Errorf("produce %d: %v", i, err)
+			}
+		})
+	}
+	if err := admin.Flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	cl, err := newTestClient(
+		ConsumeTopics(topic),
+		ShareGroup(group),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	var consumed atomic.Int64
+	for {
+		fetches := cl.PollFetches(ctx)
+		for _, e := range fetches.Errors() {
+			if e.Err != nil {
+				t.Errorf("fetch error: %v", e)
+			}
+		}
+		n := int64(len(fetches.Records()))
+		if n > 0 {
+			consumed.Add(n)
+		}
+		if consumed.Load() >= totalRecords {
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
+
+	if n := consumed.Load(); n != totalRecords {
+		t.Fatalf("expected %d records, got %d", totalRecords, n)
+	}
+}

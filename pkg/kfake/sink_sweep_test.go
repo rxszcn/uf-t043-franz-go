@@ -1,0 +1,603 @@
+package kfake
+
+// Regression tests for pkg/kgo/sink.go. Tests whose fatal message starts
+// with BUG REPRODUCED fail against the pre-fix client; the control test
+// documents neighboring behavior that already holds and must keep holding.
+
+import (
+	"context"
+	"errors"
+	"net"
+	"strconv"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// downgradeToTxnV0 sets the cluster's transaction.version feature to 0 so
+// clients use the pre-KIP-890p2 flow: an explicit AddPartitionsToTxn before
+// producing, marking addedToTxn at add time.
+func downgradeToTxnV0(t *testing.T, c *Cluster) {
+	t.Helper()
+	admin := newPlainClient(t, c)
+	req := kmsg.NewPtrUpdateFeaturesRequest()
+	fu := kmsg.NewUpdateFeaturesRequestFeatureUpdate()
+	fu.Feature = "transaction.version"
+	fu.MaxVersionLevel = 0
+	fu.UpgradeType = 2 // safe downgrade
+	req.FeatureUpdates = append(req.FeatureUpdates, fu)
+	resp, err := req.RequestWith(context.Background(), admin)
+	if err != nil {
+		t.Fatalf("UpdateFeatures: %v", err)
+	}
+	if err := kerr.ErrorForCode(resp.ErrorCode); err != nil {
+		t.Fatalf("UpdateFeatures: %v", err)
+	}
+	for _, res := range resp.Results {
+		if err := kerr.ErrorForCode(res.ErrorCode); err != nil {
+			t.Fatalf("UpdateFeatures %s: %v", res.Feature, err)
+		}
+	}
+}
+
+// produceCh produces one record and returns the channel its promise err
+// lands on.
+func produceCh(ctx context.Context, cl *kgo.Client, topic, val string) <-chan error {
+	ch := make(chan error, 1)
+	cl.Produce(ctx, &kgo.Record{Topic: topic, Value: []byte(val)}, func(_ *kgo.Record, err error) { ch <- err })
+	return ch
+}
+
+// warmTxnTopics runs one throwaway transaction producing to every topic so
+// the producer's metadata knows them all: later produces then buffer
+// synchronously, letting a single Flush put batches for several topics into
+// one produce request deterministically. The client must use ManualFlushing.
+func warmTxnTopics(t *testing.T, cl *kgo.Client, topics ...string) {
+	t.Helper()
+	ctx := context.Background()
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction(warm-up): %v", err)
+	}
+	var chs []<-chan error
+	for _, topic := range topics {
+		chs = append(chs, produceCh(ctx, cl, topic, "warm"))
+	}
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush(warm-up): %v", err)
+	}
+	for _, ch := range chs {
+		if err := <-ch; err != nil {
+			t.Fatalf("warm-up produce: %v", err)
+		}
+	}
+	if err := cl.EndTransaction(ctx, kgo.TryCommit); err != nil {
+		t.Fatalf("EndTransaction(warm-up): %v", err)
+	}
+}
+
+// failNextAddPartitions installs a one-shot control failing every partition
+// of the next AddPartitionsToTxn with the given error code, recording the
+// topics the request carried.
+func failNextAddPartitions(c *Cluster, code int16) *atomic.Value {
+	var topics atomic.Value
+	c.ControlKey(int16(kmsg.AddPartitionsToTxn), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		resp := addPartitionsErrResp(req, code)
+		var ts []string
+		for _, rt := range resp.Topics {
+			ts = append(ts, rt.Topic)
+		}
+		topics.Store(ts)
+		return resp, nil, true
+	})
+	return &topics
+}
+
+// addPartitionsErrResp answers every partition of an AddPartitionsToTxn with
+// code.
+func addPartitionsErrResp(req kmsg.Request, code int16) *kmsg.AddPartitionsToTxnResponse {
+	areq := req.(*kmsg.AddPartitionsToTxnRequest)
+	resp := areq.ResponseKind().(*kmsg.AddPartitionsToTxnResponse)
+	for _, rt := range areq.Topics {
+		st := kmsg.NewAddPartitionsToTxnResponseTopic()
+		st.Topic = rt.Topic
+		for _, p := range rt.Partitions {
+			sp := kmsg.NewAddPartitionsToTxnResponseTopicPartition()
+			sp.Partition = p
+			sp.ErrorCode = code
+			st.Partitions = append(st.Partitions, sp)
+		}
+		resp.Topics = append(resp.Topics, st)
+	}
+	return resp
+}
+
+// Pre-KIP-890p2, a partition joins the transaction via an explicit
+// AddPartitionsToTxn the FIRST time one of its batches drains; later batches
+// for that partition ride produce requests with no add. A failed add must
+// not un-mark partitions that joined via an EARLIER acked add: doing so
+// makes EndTransaction's anyAdded walk think no partition joined, skip
+// EndTxn entirely, and return nil from a commit -- while the broker still
+// holds an ongoing transaction with previously appended batches that the
+// transaction timeout then aborts. Records whose promises succeeded, in a
+// commit that returned nil, would be silently discarded.
+func TestAuditTxnV1AddPartitionsFatalKeepsEarlierAdds(t *testing.T) {
+	t.Parallel()
+	const (
+		topicP = "audit-v1-keep-p"
+		topicQ = "audit-v1-keep-q"
+	)
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topicP, topicQ))
+	downgradeToTxnV0(t, c)
+
+	cl := newPlainClient(t, c,
+		kgo.TransactionalID("audit-v1-keep"),
+		kgo.ManualFlushing(),
+	)
+	ctx := context.Background()
+
+	warmTxnTopics(t, cl, topicP, topicQ)
+	endTxns := observeEndTxns(c)
+
+	// P joins the transaction (acked AddPartitionsToTxn) and gets a batch
+	// appended; its promise succeeds.
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	r1 := produceCh(ctx, cl, topicP, "r1")
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := <-r1; err != nil {
+		t.Fatalf("first produce: %v", err)
+	}
+
+	// Fail the next AddPartitionsToTxn -- which contains only Q, P being
+	// already added -- with a fatal per-partition auth error. One flush
+	// cycle producing to both P and Q rides a single produce request, so
+	// the failure handling sees P's batch alongside Q's.
+	addTopics := failNextAddPartitions(c, kerr.TopicAuthorizationFailed.Code)
+
+	r2, r3 := produceCh(ctx, cl, topicP, "r2"), produceCh(ctx, cl, topicQ, "r3")
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	for _, ch := range []<-chan error{r2, r3} {
+		if err := <-ch; err == nil {
+			t.Fatal("expected the produces after the injected AddPartitionsToTxn failure to fail, got success")
+		}
+	}
+	got, _ := addTopics.Load().([]string)
+	if len(got) != 1 || got[0] != topicQ {
+		t.Fatalf("test premise broken: expected the failing AddPartitionsToTxn to contain only %q (P already added), got %v", topicQ, got)
+	}
+
+	// P joined this transaction and holds an appended batch whose promise
+	// succeeded; the commit must not report success.
+	err := cl.EndTransaction(ctx, kgo.TryCommit)
+	if err == nil {
+		t.Fatalf("BUG REPRODUCED: EndTransaction(TryCommit) returned nil after a fatal AddPartitionsToTxn error; %s[0] was added and produced earlier in this transaction (its promise succeeded), so the commit must fail rather than silently abandon the appended batch to the transaction-timeout abort (EndTxns issued: %d)", topicP, endTxns.Hits())
+	}
+	if !errors.Is(err, kerr.OperationNotAttempted) {
+		t.Fatalf("EndTransaction(TryCommit) = %v; want kerr.OperationNotAttempted", err)
+	}
+}
+
+// Control for the test above: a RETRIABLE per-partition error on the add
+// strips the batch, requeues it, and the next drain cycle re-adds and
+// produces it successfully -- all within one Flush. This held before the
+// sink-sweep fixes and must keep holding with the txnReq membership guard.
+func TestAuditTxnV1AddPartitionsRetriableStripControl(t *testing.T) {
+	t.Parallel()
+	const (
+		topicP = "audit-v1-strip-p"
+		topicQ = "audit-v1-strip-q"
+	)
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topicP, topicQ))
+	downgradeToTxnV0(t, c)
+
+	cl := newPlainClient(t, c,
+		kgo.TransactionalID("audit-v1-strip"),
+		kgo.ManualFlushing(),
+	)
+	ctx := context.Background()
+
+	warmTxnTopics(t, cl, topicP, topicQ)
+
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	r1 := produceCh(ctx, cl, topicP, "r1")
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := <-r1; err != nil {
+		t.Fatalf("first produce: %v", err)
+	}
+
+	addTopics := failNextAddPartitions(c, kerr.ConcurrentTransactions.Code)
+
+	r2, r3 := produceCh(ctx, cl, topicP, "r2"), produceCh(ctx, cl, topicQ, "r3")
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	for _, ch := range []<-chan error{r2, r3} {
+		if err := <-ch; err != nil {
+			t.Fatalf("produce after a stripped retriable add error must succeed end to end, got: %v", err)
+		}
+	}
+	if addTopics.Load() == nil {
+		t.Fatal("control was not consumed; the test did not exercise the injection")
+	}
+	if err := cl.EndTransaction(ctx, kgo.TryCommit); err != nil {
+		t.Fatalf("EndTransaction: %v", err)
+	}
+}
+
+// Pre-KIP-890p2, while the coordinator is still completing the prior
+// transaction (PREPARE_COMMIT), AddPartitionsToTxn answers every partition
+// with CONCURRENT_TRANSACTIONS and adds nothing; the client re-sends the add
+// until the completion finishes. A record whose context is canceled fails on
+// a metadata load error during those re-sends, and nothing is buffered from
+// then on. AbortBufferedRecords must still wait for the add, and must stop it.
+// EndTransaction then must not send EndTxn: the broker never began this
+// transaction, and below EndTxn v5 a real broker answers that abort with
+// INVALID_TXN_STATE, failing the producer ID.
+func TestTxnV1AbortWhileAddPartitionsConcurrent(t *testing.T) {
+	t.Parallel()
+	const topic = "txn-v1-abort-concurrent"
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topic))
+	downgradeToTxnV0(t, c)
+
+	cl := newPlainClient(t, c, kgo.TransactionalID("txn-v1-abort-concurrent"))
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// The prior transaction commits, so an EndTxn abort with no
+	// transaction ongoing gets INVALID_TXN_STATE, as from a real broker
+	// once the prior commit completes.
+	warmTxnTopics(t, cl, topic)
+
+	var (
+		concurrent atomic.Int32
+		release    atomic.Bool
+	)
+	c.ControlKey(int16(kmsg.AddPartitionsToTxn), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		if release.Load() {
+			c.DropControl()
+			return nil, nil, false
+		}
+		c.KeepControl()
+		concurrent.Add(1)
+		return addPartitionsErrResp(req, kerr.ConcurrentTransactions.Code), nil, true
+	})
+	endTxns := observeEndTxns(c)
+
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	rctx, cancelRecord := context.WithCancel(ctx)
+	defer cancelRecord()
+	r := produceCh(rctx, cl, topic, "v")
+
+	deadline := time.Now().Add(5 * time.Second)
+	for concurrent.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no AddPartitionsToTxn was answered with CONCURRENT_TRANSACTIONS")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	cancelRecord()
+	fault := c.Fault(Fault{Keys: []kmsg.Key{kmsg.Metadata}, Topic: topic, Err: kerr.LeaderNotAvailable, Count: -1})
+wait:
+	for {
+		select {
+		case err := <-r:
+			if !errors.Is(err, kerr.LeaderNotAvailable) {
+				t.Fatalf("record = %v; want the load error", err)
+			}
+			break wait
+		case <-time.After(10 * time.Millisecond):
+			cl.ForceMetadataRefresh()
+		case <-ctx.Done():
+			t.Fatal("the load error did not fail the record")
+		}
+	}
+	fault.Remove()
+
+	if err := cl.AbortBufferedRecords(ctx); err != nil {
+		t.Fatalf("AbortBufferedRecords while the add is retrying: %v", err)
+	}
+	if err := cl.EndTransaction(ctx, kgo.TryAbort); err != nil {
+		t.Fatalf("BUG REPRODUCED: EndTransaction(TryAbort) = %v; the broker rejected every add with CONCURRENT_TRANSACTIONS, so nothing began and no EndTxn should be sent (EndTxns issued: %d)", err, endTxns.Hits())
+	}
+	if n := endTxns.Hits(); n != 0 {
+		t.Fatalf("BUG REPRODUCED: EndTransaction(TryAbort) issued %d EndTxn for a transaction the broker never began", n)
+	}
+
+	// The prior transaction finishes completing: the next add succeeds,
+	// and the next commit sends the first EndTxn we observe.
+	release.Store(true)
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	next := produceCh(ctx, cl, topic, "next")
+	if err := cl.Flush(ctx); err != nil {
+		t.Fatalf("Flush: %v", err)
+	}
+	if err := <-next; err != nil {
+		t.Fatalf("produce after the add succeeded: %v", err)
+	}
+	if err := cl.EndTransaction(ctx, kgo.TryCommit); err != nil {
+		t.Fatalf("EndTransaction(TryCommit): %v", err)
+	}
+	if n := endTxns.Hits(); n != 1 {
+		t.Fatalf("EndTxns issued = %d; want 1 to commit the next transaction", n)
+	}
+}
+
+// EndTransaction documents that a commit attempted while the producer ID has
+// an error returns OperationNotAttempted and the caller should retry with
+// TryAbort (GroupTransactSession.End does this retry internally). The retry
+// must actually issue an EndTxn abort: the broker has an ongoing transaction
+// holding the earlier appended batch, which otherwise stalls read_committed
+// consumers on the LSO until the transaction timeout aborts it.
+func TestAuditTxnAbortRetryAfterOperationNotAttempted(t *testing.T) {
+	t.Parallel()
+	const topic = "audit-abort-retry"
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topic))
+	endTxns := observeEndTxns(c)
+
+	cl := newPlainClient(t, c, kgo.TransactionalID("audit-abort-retry"))
+	ctx := context.Background()
+
+	if err := cl.BeginTransaction(); err != nil {
+		t.Fatalf("BeginTransaction: %v", err)
+	}
+	// First produce succeeds: the partition is marked added to the
+	// transaction on the successful response.
+	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("r1")}).FirstErr(); err != nil {
+		t.Fatalf("first produce: %v", err)
+	}
+
+	// Fail the next produce with INVALID_PRODUCER_ID_MAPPING: an
+	// OOOSN-family error that fails the producer ID for transactional
+	// producers and is neither retriable nor recoverable under KIP-890p2,
+	// so the abort below cannot take the recovered-early-return and must
+	// reach the broker via EndTxn.
+	c.Fault(Fault{
+		Keys:  []kmsg.Key{kmsg.Produce},
+		Topic: topic,
+		Err:   kerr.InvalidProducerIDMapping,
+		Count: 1,
+	})
+	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("r2")}).FirstErr(); err == nil {
+		t.Fatal("expected the injected produce failure, got success")
+	}
+
+	if err := cl.EndTransaction(ctx, kgo.TryCommit); !errors.Is(err, kerr.OperationNotAttempted) {
+		t.Fatalf("EndTransaction(TryCommit) = %v; want kerr.OperationNotAttempted", err)
+	}
+	if err := cl.EndTransaction(ctx, kgo.TryAbort); err != nil {
+		t.Fatalf("EndTransaction(TryAbort) = %v", err)
+	}
+	if endTxns.Hits() == 0 {
+		t.Fatal("BUG REPRODUCED: the documented TryAbort retry after OperationNotAttempted issued no EndTxn; the commit attempt consumed the transaction state (inTxn, addedToTxn), so the abort silently no-opped and the broker-side transaction stays ongoing until the transaction timeout")
+	}
+}
+
+type produceBatchWrittenHook struct{ n atomic.Int32 }
+
+func (h *produceBatchWrittenHook) OnProduceBatchWritten(_ kgo.BrokerMetadata, _ string, _ int32, _ kgo.ProduceBatchMetrics) {
+	h.n.Add(1)
+}
+
+// A buggy broker can reply with the same topic entry twice in one produce
+// response. The first entry finishes the batch; the duplicate takes the
+// "erroneously replied" arm, which must not erase the finished batch's
+// metrics: the deferred metrics hook would then silently skip
+// OnProduceBatchWritten for a successfully produced batch.
+func TestAuditProduceDuplicateResponseEntryKeepsHook(t *testing.T) {
+	t.Parallel()
+	const topic = "audit-dup-resp"
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topic))
+
+	hook := new(produceBatchWrittenHook)
+	cl := newPlainClient(t, c, kgo.WithHooks(hook))
+
+	c.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+		preq := req.(*kmsg.ProduceRequest)
+		resp := preq.ResponseKind().(*kmsg.ProduceResponse)
+		for _, rt := range preq.Topics {
+			st := kmsg.NewProduceResponseTopic()
+			st.Topic = rt.Topic
+			st.TopicID = rt.TopicID
+			for _, rp := range rt.Partitions {
+				sp := kmsg.NewProduceResponseTopicPartition()
+				sp.Partition = rp.Partition
+				st.Partitions = append(st.Partitions, sp)
+			}
+			resp.Topics = append(resp.Topics, st, st) // duplicated entry: buggy-broker shape
+		}
+		return resp, nil, true
+	})
+
+	if err := cl.ProduceSync(context.Background(), &kgo.Record{Topic: topic, Value: []byte("v")}).FirstErr(); err != nil {
+		t.Fatalf("ProduceSync: %v", err)
+	}
+	// The hook fires on its own goroutine after the response is handled.
+	deadline := time.Now().Add(2 * time.Second)
+	for hook.n.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := hook.n.Load(); got != 1 {
+		t.Fatalf("BUG REPRODUCED: OnProduceBatchWritten fired %d times for one successfully produced batch; a duplicated produce response topic entry deleted the batch's metrics before the deferred hook ran", got)
+	}
+}
+
+// A produce answered REQUEST_TIMED_OUT retries after the produce backoff,
+// not after the next metadata update, which MetadataMinAge holds off.
+func TestProduceTimedOutRetriesOnBackoff(t *testing.T) {
+	t.Parallel()
+
+	const topic = "t"
+	c := newCluster(t, NumBrokers(1), SeedTopics(1, topic))
+	h := c.Fault(Fault{
+		Keys:  []kmsg.Key{kmsg.Produce},
+		Topic: topic,
+		Err:   kerr.RequestTimedOut,
+	})
+	cl := newPlainClient(t, c,
+		kgo.DefaultProduceTopic(topic),
+		kgo.MetadataMinAge(30*time.Second),
+		kgo.RetryBackoffFn(func(int) time.Duration { return 50 * time.Millisecond }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	start := time.Now()
+	if err := cl.ProduceSync(ctx, kgo.StringRecord("p0")).FirstErr(); err != nil {
+		t.Fatalf("produce did not heal past the timed-out append: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("retry took %v; want the produce backoff, not a metadata update", elapsed)
+	}
+	if h.Hits() != 1 {
+		t.Fatalf("fault hit %d times; want 1", h.Hits())
+	}
+	// The timed-out append still landed, so the retry deduplicates.
+	if hwm := c.PartitionInfo(topic, 0).HighWatermark; hwm != 1 {
+		t.Fatalf("high watermark %d; want 1", hwm)
+	}
+}
+
+// A broker can answer NOT_LEADER_OR_FOLLOWER with a KIP-951 CurrentLeader
+// that names the leader we are already producing to at the epoch we already
+// have, or at an older epoch. That hint moves nothing, and staging it as a
+// move skipped both the retry wait and the metadata update, so every retry
+// went out at round trip speed until the record budget was gone.
+func TestProduceStaleLeaderHintBacksOff(t *testing.T) {
+	t.Parallel()
+	for _, idempotent := range []bool{false, true} {
+		for _, test := range []struct {
+			name        string
+			epochDelta  int32 // hinted epoch, relative to the one the client has
+			leaderDelta int32 // hinted leader, relative to the real one
+			immediate   int32 // retries that go out at once because the hint moved us
+		}{
+			{name: "same_epoch"},
+			{name: "older_epoch", epochDelta: -1},
+			{name: "same_epoch_other_leader", leaderDelta: 1},
+			{name: "newer_epoch_then_repeated", epochDelta: 1, immediate: 1},
+		} {
+			t.Run(test.name+"/idempotent="+strconv.FormatBool(idempotent), func(t *testing.T) {
+				t.Parallel()
+
+				const topic = "stale-hint"
+				const retries = 3
+				c := newCluster(t, NumBrokers(1), SeedTopics(1, topic))
+				// Start at epoch 1 so that an older hint is still a valid epoch.
+				if err := c.MoveTopicPartition(topic, 0, 0); err != nil {
+					t.Fatal(err)
+				}
+
+				var backoffs atomic.Int32
+				opts := []kgo.Opt{
+					// Any request answered with a retryable error waits on
+					// RetryBackoffFn; leave produce as the only one that can.
+					kgo.DisableClientMetrics(),
+					kgo.RetryBackoffFn(func(int) time.Duration { backoffs.Add(1); return 10 * time.Millisecond }),
+					kgo.RecordRetries(retries),
+				}
+				if !idempotent {
+					opts = append(opts, kgo.DisableIdempotentWrite(), kgo.MaxProduceRequestsInflightPerBroker(1))
+				}
+				cl := newPlainClient(t, c, opts...)
+
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+				defer cancel()
+				if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("warmup")}).FirstErr(); err != nil {
+					t.Fatal(err)
+				}
+				backoffs.Store(0)
+
+				pi := c.PartitionInfo(topic, 0)
+				host, portStr, _ := net.SplitHostPort(c.ListenAddrs()[0])
+				port, _ := strconv.Atoi(portStr)
+
+				var produces atomic.Int32
+				c.ControlKey(int16(kmsg.Produce), func(req kmsg.Request) (kmsg.Response, error, bool) {
+					c.KeepControl()
+					produces.Add(1)
+					r := req.ResponseKind().(*kmsg.ProduceResponse)
+					rt := kmsg.NewProduceResponseTopic()
+					rt.Topic = topic
+					rt.TopicID = req.(*kmsg.ProduceRequest).Topics[0].TopicID
+					rp := kmsg.NewProduceResponseTopicPartition()
+					rp.ErrorCode = kerr.NotLeaderForPartition.Code
+					rp.CurrentLeader.LeaderID = pi.Leader + test.leaderDelta
+					rp.CurrentLeader.LeaderEpoch = pi.Epoch + test.epochDelta
+					rt.Partitions = append(rt.Partitions, rp)
+					r.Topics = append(r.Topics, rt)
+					r.Brokers = []kmsg.ProduceResponseBroker{{NodeID: pi.Leader, Host: host, Port: int32(port)}}
+					return r, nil, true
+				})
+
+				err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("probe")}).FirstErr()
+				if !errors.Is(err, kerr.NotLeaderForPartition) {
+					t.Errorf("got err %v, want NOT_LEADER_OR_FOLLOWER", err)
+				}
+				if got := produces.Load(); got != retries+1 {
+					t.Errorf("got %d produce requests, want %d", got, retries+1)
+				}
+				// A hint that moves us retries at once; every other retry,
+				// including one for a same-epoch hint at another leader,
+				// waits exactly once. Exactly once also pins drain checking
+				// its backoff after taking an inflight slot, not before.
+				if want := int32(retries) - test.immediate; backoffs.Load() != want {
+					t.Errorf("got %d backoffs, want %d", backoffs.Load(), want)
+				}
+			})
+		}
+	}
+}
+
+// A hint that names a new leader still moves us and retries there at once.
+func TestProduceLeaderHintMovesWithoutBackoff(t *testing.T) {
+	t.Parallel()
+
+	const topic = "hint-move"
+	c := newCluster(t, NumBrokers(2), SeedTopics(1, topic))
+	var backoffs atomic.Int32
+	cl := newPlainClient(t, c,
+		kgo.DisableClientMetrics(),
+		kgo.RetryBackoffFn(func(int) time.Duration { backoffs.Add(1); return time.Second }),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("warmup")}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	backoffs.Store(0)
+
+	old := c.PartitionInfo(topic, 0)
+	if err := c.MoveTopicPartition(topic, 0, (old.Leader+1)%2); err != nil {
+		t.Fatal(err)
+	}
+	produces := c.Fault(Fault{Keys: []kmsg.Key{kmsg.Produce}, Observe: true, Count: -1})
+
+	if err := cl.ProduceSync(ctx, &kgo.Record{Topic: topic, Value: []byte("probe")}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	if got := produces.Hits(); got != 2 {
+		t.Errorf("got %d produce requests, want the rejected attempt and its retry", got)
+	}
+	if got := backoffs.Load(); got != 0 {
+		t.Errorf("got %d backoffs, want 0", got)
+	}
+}

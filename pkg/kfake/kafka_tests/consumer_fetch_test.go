@@ -1,0 +1,200 @@
+// Derived via LLM from Apache Kafka's PlaintextConsumerFetchTest.java (Apache 2.0).
+// https://github.com/apache/kafka/blob/trunk/clients/clients-integration-tests/src/test/java/org/apache/kafka/clients/consumer/PlaintextConsumerFetchTest.java
+
+package kafka_tests
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kfake"
+	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// TestFetchInvalidOffset verifies that with NoResetOffset, consuming from an
+// unknown partition offset returns an error rather than silently resetting.
+func TestFetchInvalidOffset(t *testing.T) {
+	t.Parallel()
+	topic := "fetch-invalid-offset"
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+	// Produce some records so there's data.
+	producer := newClient848(t, c, kgo.DefaultProduceTopic(topic))
+	produceSync(t, producer, kgo.StringRecord("v1"), kgo.StringRecord("v2"))
+
+	// Create consumer starting at an offset beyond the log end, with no reset.
+	consumer := newClient848(t, c,
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			topic: {0: kgo.NewOffset().At(100)},
+		}),
+		kgo.ConsumeResetOffset(kgo.NoResetOffset()),
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	fs := consumer.PollFetches(ctx)
+	// With NoResetOffset, we expect an error for the out-of-range offset.
+	errs := fs.Errors()
+	if len(errs) == 0 && fs.NumRecords() == 0 {
+		// Timeout without data is also acceptable - the point is no records returned.
+		return
+	}
+	if len(errs) > 0 {
+		// We got an error, which is the expected behavior.
+		return
+	}
+	// If we somehow got records, that's wrong.
+	if fs.NumRecords() > 0 {
+		t.Errorf("expected no records with invalid offset, got %d", fs.NumRecords())
+	}
+}
+
+// TestFetchOutOfRangeResetEarliest verifies that when a consumer seeks beyond
+// the log range and the reset policy is earliest, it resets to offset 0.
+func TestFetchOutOfRangeResetEarliest(t *testing.T) {
+	t.Parallel()
+	topic := "fetch-reset-earliest"
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+	producer := newClient848(t, c, kgo.DefaultProduceTopic(topic))
+	produceSync(t, producer, kgo.StringRecord("v1"), kgo.StringRecord("v2"), kgo.StringRecord("v3"))
+
+	// Start at an out-of-range offset with reset to earliest.
+	consumer := newClient848(t, c,
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			topic: {0: kgo.NewOffset().At(100)},
+		}),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtStart()),
+	)
+
+	records := consumeN(t, consumer, 3, 5*time.Second)
+	if records[0].Offset != 0 {
+		t.Errorf("expected reset to offset 0, got %d", records[0].Offset)
+	}
+}
+
+// TestFetchOutOfRangeResetLatest verifies that when a consumer seeks beyond
+// the log range and the reset policy is latest, it resets to the end and
+// only sees newly produced records.
+func TestFetchOutOfRangeResetLatest(t *testing.T) {
+	t.Parallel()
+	topic := "fetch-reset-latest"
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+	producer := newClient848(t, c, kgo.DefaultProduceTopic(topic))
+	old := []*kgo.Record{kgo.StringRecord("old1"), kgo.StringRecord("old2")}
+	produceSync(t, producer, old...)
+
+	// The reset is three round trips: the fetch at 100 fails out of
+	// range, the client lists offsets, and it then fetches the end. Wait
+	// for that last fetch, otherwise producing can move the end past the
+	// record we want to see.
+	waitReset := fetchGate(t, c, func(p kmsg.FetchRequestTopicPartition) bool {
+		return p.Partition == 0 && p.FetchOffset == int64(len(old))
+	})
+
+	// Start at an out-of-range offset with reset to latest.
+	consumer := newClient848(t, c,
+		kgo.ConsumePartitions(map[string]map[int32]kgo.Offset{
+			topic: {0: kgo.NewOffset().At(100)},
+		}),
+		kgo.ConsumeResetOffset(kgo.NewOffset().AtEnd()),
+	)
+	waitReset()
+
+	// Produce a new record after the consumer has reset to end.
+	produceSync(t, producer, kgo.StringRecord("new-after-reset"))
+
+	records := consumeN(t, consumer, 1, 5*time.Second)
+	if string(records[0].Value) != "new-after-reset" {
+		t.Errorf("expected to consume 'new-after-reset', got %q", string(records[0].Value))
+	}
+}
+
+// TestFetchRecordLargerThanMaxBytes verifies that a record larger than the
+// max bytes setting is still returned (KIP-74: a single record is always
+// returned even if it exceeds max bytes). Tests both FetchMaxBytes and
+// FetchMaxPartitionBytes.
+func TestFetchRecordLargerThanMaxBytes(t *testing.T) {
+	t.Parallel()
+	for _, tt := range []struct {
+		name string
+		opt  kgo.Opt
+	}{
+		{"FetchMaxBytes", kgo.FetchMaxBytes(1024)},
+		{"FetchMaxPartitionBytes", kgo.FetchMaxPartitionBytes(1024)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			topic := "fetch-large-" + tt.name
+			c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+			producer := newClient848(t, c, kgo.DefaultProduceTopic(topic))
+
+			largeValue := []byte(strings.Repeat("x", 10_000))
+			produceSync(t, producer, &kgo.Record{Value: largeValue})
+
+			consumer := newClient848(t, c,
+				kgo.ConsumeTopics(topic),
+				tt.opt,
+			)
+
+			records := consumeN(t, consumer, 1, 5*time.Second)
+			if !bytes.Equal(records[0].Value, largeValue) {
+				t.Errorf("large record was not returned correctly: got %d bytes, expected %d", len(records[0].Value), len(largeValue))
+			}
+		})
+	}
+}
+
+// TestFetchHonoursFetchSizeIfLargeRecordNotFirst verifies that fetch size is
+// respected when a large record is not the first record in the partition.
+// The first small record should be returned, but the second large record
+// should not be included in the same fetch.
+func TestFetchHonoursFetchSizeIfLargeRecordNotFirst(t *testing.T) {
+	t.Parallel()
+	topic := "fetch-honour-size"
+	c := newCluster(t, kfake.NumBrokers(1), kfake.SeedTopics(1, topic))
+
+	producer := newClient848(t, c, kgo.DefaultProduceTopic(topic))
+
+	// Produce a small record, then a large record in separate batches.
+	smallRecord := kgo.StringRecord("small")
+	produceSync(t, producer, smallRecord)
+	largeValue := strings.Repeat("z", 10_000)
+	largeRecord := kgo.StringRecord(largeValue)
+	produceSync(t, producer, largeRecord)
+
+	// Consume with a fetch size that fits the small record but not the large.
+	consumer := newClient848(t, c,
+		kgo.ConsumeTopics(topic),
+		kgo.FetchMaxPartitionBytes(512),
+	)
+
+	// First poll should return the small record.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	fs := consumer.PollFetches(ctx)
+	if fs.NumRecords() == 0 {
+		t.Fatal("expected at least 1 record")
+	}
+	firstRecord := fs.Records()[0]
+	if string(firstRecord.Value) != "small" {
+		t.Errorf("expected first record 'small', got %q", string(firstRecord.Value))
+	}
+
+	// Second poll should return the large record (KIP-74: first in partition always returned).
+	fs = consumer.PollFetches(ctx)
+	if fs.NumRecords() == 0 {
+		t.Fatal("expected the large record in next fetch")
+	}
+	secondRecord := fs.Records()[0]
+	if string(secondRecord.Value) != largeValue {
+		t.Errorf("expected large record, got %d bytes", len(secondRecord.Value))
+	}
+}

@@ -1,0 +1,144 @@
+package kfake
+
+import (
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// OffsetForLeaderEpoch: v3-4
+//
+// Behavior:
+// * Returns the end offset for a given leader epoch
+// * Used by clients to detect log truncation (KIP-320)
+// * Only supports consumer replica ID (-1)
+//
+// Version notes:
+// * v3: CurrentLeaderEpoch for fencing
+// * v4: Flexible versions
+
+func init() { regKey(23, 3, 4) }
+
+func (c *Cluster) handleOffsetForLeaderEpoch(creq *clientReq) (kmsg.Response, error) {
+	var (
+		b    = creq.cc.b
+		req  = creq.kreq.(*kmsg.OffsetForLeaderEpochRequest)
+		resp = req.ResponseKind().(*kmsg.OffsetForLeaderEpochResponse)
+	)
+
+	if err := c.checkReqVersion(req.Key(), req.Version); err != nil {
+		return nil, err
+	}
+
+	tidx := make(map[string]int)
+	donet := func(t string) *kmsg.OffsetForLeaderEpochResponseTopic {
+		if i, ok := tidx[t]; ok {
+			return &resp.Topics[i]
+		}
+		tidx[t] = len(resp.Topics)
+		st := kmsg.NewOffsetForLeaderEpochResponseTopic()
+		st.Topic = t
+		resp.Topics = append(resp.Topics, st)
+		return &resp.Topics[len(resp.Topics)-1]
+	}
+	donep := func(t string, p int32, errCode int16) *kmsg.OffsetForLeaderEpochResponseTopicPartition {
+		sp := kmsg.NewOffsetForLeaderEpochResponseTopicPartition()
+		sp.Partition = p
+		sp.ErrorCode = errCode
+		st := donet(t)
+		st.Partitions = append(st.Partitions, sp)
+		return &st.Partitions[len(st.Partitions)-1]
+	}
+
+	for _, rt := range req.Topics {
+		ps, ok := c.data.tps.gett(rt.Topic)
+		for _, rp := range rt.Partitions {
+			pd, exists := ps[rp.Partition]
+			k := faultKey{topic: rt.Topic, misrouted: exists && pd.leader != b}
+			if e := c.deny(creq, rt.Topic, kmsg.ACLResourceTypeTopic, kmsg.ACLOperationDescribe, k.part(rp.Partition)); e != nil {
+				donep(rt.Topic, rp.Partition, e.Code)
+				continue
+			}
+			if req.ReplicaID >= 0 {
+				donep(rt.Topic, rp.Partition, kerr.UnknownServerError.Code)
+				continue
+			}
+			if !ok {
+				donep(rt.Topic, rp.Partition, kerr.UnknownTopicOrPartition.Code)
+				continue
+			}
+			pd, ok := ps[rp.Partition]
+			if !ok {
+				donep(rt.Topic, rp.Partition, kerr.UnknownTopicOrPartition.Code)
+				continue
+			}
+			if pd.leader != b {
+				donep(rt.Topic, rp.Partition, kerr.NotLeaderForPartition.Code)
+				continue
+			}
+			if le := rp.CurrentLeaderEpoch; le != -1 {
+				if le < pd.epoch {
+					donep(rt.Topic, rp.Partition, kerr.FencedLeaderEpoch.Code)
+					continue
+				} else if le > pd.epoch {
+					donep(rt.Topic, rp.Partition, kerr.UnknownLeaderEpoch.Code)
+					continue
+				}
+			}
+
+			sp := donep(rt.Topic, rp.Partition, 0)
+
+			// If the user is requesting our current epoch, we return the HWM.
+			if rp.LeaderEpoch == pd.epoch {
+				sp.LeaderEpoch = pd.epoch
+				sp.EndOffset = pd.highWatermark
+				continue
+			}
+
+			// Requested epoch is not yet known: keep -1 returns.
+			if rp.LeaderEpoch > pd.epoch {
+				sp.LeaderEpoch = -1
+				sp.EndOffset = -1
+				continue
+			}
+
+			// Two-level binary search for the first batch with epoch > requested.
+			nextEpoch := rp.LeaderEpoch + 1
+			si, mi, cur := pd.findBatchMeta(int64(nextEpoch), func(m *batchMeta) int64 { return int64(m.epoch) })
+
+			// No batch is after the requested epoch, so it ends at
+			// the log end. As in Kafka, we return the last batch's
+			// epoch, or the requested epoch if the log is empty.
+			if cur == nil {
+				sp.LeaderEpoch = rp.LeaderEpoch
+				sp.EndOffset = pd.highWatermark
+				for i := len(pd.segments) - 1; i >= 0; i-- {
+					if idx := pd.segments[i].index; len(idx) > 0 {
+						sp.LeaderEpoch = idx[len(idx)-1].epoch
+						break
+					}
+				}
+				continue
+			}
+
+			// Next epoch is actually the first epoch: return the
+			// requested epoch and the LSO.
+			if si == 0 && mi == 0 {
+				sp.LeaderEpoch = rp.LeaderEpoch
+				sp.EndOffset = pd.logStartOffset
+				continue
+			}
+
+			// Get the batch before cur.
+			var prev *batchMeta
+			if mi > 0 {
+				prev = &pd.segments[si].index[mi-1]
+			} else {
+				prevSeg := &pd.segments[si-1]
+				prev = &prevSeg.index[len(prevSeg.index)-1]
+			}
+			sp.LeaderEpoch = prev.epoch
+			sp.EndOffset = cur.firstOffset
+		}
+	}
+	return resp, nil
+}

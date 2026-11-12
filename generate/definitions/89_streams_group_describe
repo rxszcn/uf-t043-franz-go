@@ -1,0 +1,154 @@
+// TopologyDescriptionNode is a processor node within a streams topology
+// description.
+TopologyDescriptionNode => not top level, no encoding, flexible v0+
+  // Name is the name of this node.
+  Name: string
+  // NodeType is the type of this node.
+  NodeType: int8
+  // SourceTopics are the source topics this node reads from.
+  SourceTopics: [string]
+  // SinkTopic is the sink topic this node writes to, or null.
+  SinkTopic: nullable-string
+  // Stores are the state stores connected to this node.
+  Stores: [string]
+  // Successors are the names of this node's successor nodes.
+  Successors: [string]
+
+// TopologyDescriptionSubtopology is a subtopology within a streams topology
+// description.
+TopologyDescriptionSubtopology => not top level, no encoding, flexible v0+
+  // SubtopologyID uniquely identifies the subtopology.
+  SubtopologyID: string
+  // Nodes are the processor nodes of the subtopology.
+  Nodes: [TopologyDescriptionNode]
+
+// TopologyDescriptionGlobalStore is a global store within a streams topology
+// description.
+TopologyDescriptionGlobalStore => not top level, no encoding, flexible v0+
+  // Source is the source node of the global store.
+  Source: TopologyDescriptionNode
+  // Processor is the processor node of the global store.
+  Processor: TopologyDescriptionNode
+
+// StreamsAssignment contains streams group task assignments.
+StreamsAssignment => not top level, no encoding, flexible v0+
+  // ActiveTasks are active tasks for this client.
+  ActiveTasks: [TaskIDs]
+  // StandbyTasks are standby tasks for this client.
+  StandbyTasks: [TaskIDs]
+  // WarmupTasks are warm-up tasks for this client.
+  WarmupTasks: [TaskIDs]
+
+// StreamsGroupDescribeRequest describes one or more streams groups. This is
+// part of KIP-1071.
+StreamsGroupDescribeRequest => key 89, max version 1, flexible v0+
+  // Groups are the IDs of the groups to describe.
+  Groups: [string]
+  // IncludeAuthorizedOperations controls whether to include authorized
+  // operations.
+  IncludeAuthorizedOperations: bool
+  // IncludeTopologyDescription controls whether to include the full
+  // topology description in the response.
+  IncludeTopologyDescription: bool // v1+
+
+// StreamsGroupDescribeResponse is returned from a StreamsGroupDescribeRequest.
+StreamsGroupDescribeResponse =>
+  ThrottleMillis
+  // Groups contains each described group.
+  Groups: [=>]
+    // ErrorCode is the describe error, or 0 if there was no error.
+    ErrorCode: int16
+    // ErrorMessage is the top-level error message, or null if there was no
+    // error.
+    ErrorMessage: nullable-string
+    // Group is the group ID.
+    Group: string
+    // State is the group state.
+    State: string
+    // Epoch is the group epoch.
+    Epoch: int32
+    // AssignmentEpoch is the assignment epoch.
+    AssignmentEpoch: int32
+    // Topology is the topology metadata currently initialized for the streams
+    // application. Null in case of a describe error.
+    Topology: nullable=>
+      // Epoch is the epoch of the currently initialized topology.
+      Epoch: int32
+      // Subtopologies are the subtopologies of the streams application. Null
+      // if the group is uninitialized, source topics are missing, or
+      // incorrectly partitioned.
+      Subtopologies: nullable[=>]
+        // SubtopologyID uniquely identifies the subtopology.
+        SubtopologyID: string
+        // SourceTopics are the topics the subtopology reads from.
+        SourceTopics: [string]
+        // RepartitionSinkTopics are the repartition topics the subtopology
+        // writes to.
+        RepartitionSinkTopics: [string]
+        // StateChangelogTopics are changelog topics associated with this
+        // subtopology.
+        StateChangelogTopics: [TopicInfo]
+        // RepartitionSourceTopics are source topics that are internally
+        // created repartition topics.
+        RepartitionSourceTopics: [TopicInfo]
+    // Members are the members of the group.
+    Members: [=>]
+      // MemberID is the member ID.
+      MemberID: string
+      // MemberEpoch is the member epoch.
+      MemberEpoch: int32
+      // InstanceID is the member instance ID for static membership.
+      InstanceID: nullable-string
+      // RackID is the rack ID.
+      RackID: nullable-string
+      // ClientID is the client ID.
+      ClientID: string
+      // ClientHost is the client host.
+      ClientHost: string
+      // TopologyEpoch is the epoch of the topology on the client.
+      TopologyEpoch: int32
+      // ProcessID is the identity of the streams instance that may have
+      // multiple clients.
+      ProcessID: string
+      // UserEndpoint is the user-defined endpoint for Interactive Queries.
+      // Null if not defined for this client.
+      UserEndpoint: nullable=>
+        // Host is the hostname.
+        Host: string
+        // Port is the port.
+        Port: uint16
+      // ClientTags are used for rack-aware assignment.
+      ClientTags: [=>]
+        // Key is the tag key.
+        Key: string
+        // Value is the tag value.
+        Value: string
+      // TaskOffsets are cumulative changelog offsets for tasks.
+      TaskOffsets: [TaskOffset]
+      // TaskEndOffsets are cumulative changelog end offsets for tasks.
+      TaskEndOffsets: [TaskOffset]
+      // Assignment is the current assignment.
+      Assignment: StreamsAssignment
+      // TargetAssignment is the target assignment.
+      TargetAssignment: StreamsAssignment
+      // IsClassic is true for classic members that have not been upgraded yet.
+      IsClassic: bool
+    // AuthorizedOperations is a 32-bit bitfield representing authorized
+    // operations for the group.
+    AuthorizedOperations: int32(-2147483648)
+    // TopologyDescription is the full topology description for this group;
+    // non-null if and only if TopologyDescriptionStatus is AVAILABLE (3).
+    TopologyDescription: nullable=> // v1+
+      // Subtopologies are the subtopologies that make up this topology.
+      Subtopologies: [TopologyDescriptionSubtopology]
+      // GlobalStores are the global stores of this topology.
+      GlobalStores: [TopologyDescriptionGlobalStore]
+    // TopologyDescriptionStatus is the status of the topology description:
+    // 0=NOT_REQUESTED, 1=NOT_STORED, 2=ERROR, 3=AVAILABLE.
+    TopologyDescriptionStatus: int8 // v1+
+    // AssignorName is the task assignor the group coordinator will use for
+    // the next assignment (KIP-1357). This may differ from the assignor that
+    // computed the current assignment, because changing the assignor
+    // configuration does not trigger a rebalance. Null in case of a describe
+    // error.
+    AssignorName: nullable-string // v1+

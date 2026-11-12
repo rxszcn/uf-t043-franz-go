@@ -1,0 +1,1308 @@
+package kgo
+
+import (
+	"context"
+	"crypto/rand"
+	"errors"
+	"fmt"
+	"math"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/twmb/franz-go/pkg/kerr"
+	"github.com/twmb/franz-go/pkg/kmsg"
+)
+
+// Allow adding a topic to consume after the client is initialized with nothing
+// to consume.
+func TestIssue325(t *testing.T) {
+	t.Parallel()
+
+	topic, cleanup := tmpTopic(t)
+	defer cleanup()
+
+	cl, _ := newTestClient(
+		DefaultProduceTopic(topic),
+		UnknownTopicRetries(-1),
+	)
+	defer cl.Close()
+
+	if err := cl.ProduceSync(context.Background(), StringRecord("foo")).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cl.AddConsumeTopics(topic)
+	recs := cl.PollFetches(ctx).Records()
+	if len(recs) != 1 || string(recs[0].Value) != "foo" {
+		t.Fatal(recs)
+	}
+}
+
+// Allow adding a topic to consume after the client is initialized with nothing
+// to consume.
+func TestConsumeTopicRetrieval(t *testing.T) {
+	t.Parallel()
+	topicName := "test"
+	cl, _ := newTestClient()
+	defer cl.Close()
+	topics := cl.GetConsumeTopics()
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+	cl.AddConsumeTopics(topicName)
+	topics = cl.GetConsumeTopics()
+	if len(topics) != 1 || topics[0] != topicName {
+		t.Fatalf("expected to see %v, got %v", topicName, topics)
+	}
+}
+
+// Allow adding a topic to consume after the client is initialized with nothing
+// to consume.
+func TestConsumeTopicRetrieval_Many(t *testing.T) {
+	t.Parallel()
+	topicName := "test"
+	cl, _ := newTestClient()
+	defer cl.Close()
+	topics := cl.GetConsumeTopics()
+	if len(topics) != 0 {
+		t.Fatalf("expected no topics, got %v", topics)
+	}
+	for i := range 100 {
+		cl.AddConsumeTopics(fmt.Sprintf("%s_%d", topicName, i))
+	}
+	topics = cl.GetConsumeTopics()
+	slices.Sort(topics)
+	if len(topics) != 100 || topics[0] != fmt.Sprintf("%s_%d", topicName, 0) {
+		t.Fatalf("expected to see %v, got %v", topicName, topics)
+	}
+}
+
+func TestConsumeRegex(t *testing.T) {
+	t.Parallel()
+
+	pfx := randsha()[:16] + "-"
+
+	internal, _, internalCleanup := internalTopic(t, pfx+"internal")
+	defer internalCleanup()
+
+	// Create test topics
+	var cleanup []func()
+	for _, name := range []string{
+		pfx + "include-1",
+		pfx + "include-2",
+		pfx + "exclude-1",
+		pfx + "exclude-2",
+	} {
+		_, c := tmpNamedTopicPartitions(t, name, 1)
+		cleanup = append(cleanup, c)
+	}
+	defer func() {
+		for _, c := range cleanup {
+			c()
+		}
+	}()
+
+	logs := newRingLogger(testLogger(), 4096)
+	cl, _ := newTestClient(
+		ConsumeTopics(pfx+".*", regexp.QuoteMeta(internal)), // Match all pfx-* topics and the internal topic
+		ConsumeExcludeTopics(pfx+"exclude-.*"),              // Exclude pfx-exclude-* topics
+		ConsumeRegex(),
+		MetadataMinAge(100*time.Millisecond),
+		WithLogger(logs),
+	)
+	defer cl.Close()
+	var topics []string
+	wait(t, 15*time.Second, func() error {
+		cl.triggerUpdateMetadataNow("querying metadata for consumer initialization")
+		topics = cl.GetConsumeTopics()
+		if len(topics) != 2 {
+			return fmt.Errorf("expected 2 topics, got %v", topics)
+		}
+		return nil
+	})
+	for _, topic := range topics {
+		if !strings.HasPrefix(topic, pfx+"include-") {
+			t.Fatalf("expected to see %sinclude-*, got %v", pfx, topic)
+		}
+	}
+
+	// Every evaluated topic is logged under the decision we made for it.
+	wait(t, 15*time.Second, func() error {
+		added, excluded, skippedInternal := regexLogs(logs)
+		for _, want := range []string{pfx + "include-1", pfx + "include-2"} {
+			if !strings.Contains(added, want) {
+				return fmt.Errorf("added %q is missing %s", added, want)
+			}
+		}
+		if strings.Contains(added, pfx+"exclude-") {
+			return fmt.Errorf("added %q contains an excluded topic", added)
+		}
+		for _, want := range []string{pfx + "exclude-.*[", pfx + "exclude-1", pfx + "exclude-2"} {
+			if !strings.Contains(excluded, want) {
+				return fmt.Errorf("excluded %q is missing %s", excluded, want)
+			}
+		}
+		if !slices.Contains(skippedInternal, internal) {
+			return fmt.Errorf("skipped_internal %v is missing %s", skippedInternal, internal)
+		}
+		return nil
+	})
+}
+
+// regexLogs returns what the regex filter logged across all metadata updates.
+func regexLogs(r *ringLogger) (added, excluded string, skippedInternal []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.buf {
+		if e.msg != "consumer regular expressions evaluated on new topics" {
+			continue
+		}
+		for i := 0; i+1 < len(e.keyvals); i += 2 {
+			switch e.keyvals[i] {
+			case "added":
+				added += " " + e.keyvals[i+1].(string)
+			case "excluded":
+				excluded += " " + e.keyvals[i+1].(string)
+			case "skipped_internal":
+				skippedInternal = append(skippedInternal, e.keyvals[i+1].([]string)...)
+			}
+		}
+	}
+	return added, excluded, skippedInternal
+}
+
+// A share consumer subscribes by the names our regex filter resolved, so the
+// filter must skip internal topics for it as well.
+func TestConsumeRegexShareSkipsInternal(t *testing.T) {
+	t.Parallel()
+	adm() // ensure allowShare is initialized
+	if !allowShare {
+		t.Skip("broker does not support share groups (requires ShareFetch v2 and ShareAcknowledge v2, Kafka 4.2+)")
+	}
+
+	pfx := randsha()[:16] + "-"
+	internal, _, internalCleanup := internalTopic(t, pfx+"internal")
+	defer internalCleanup()
+	topic, topicCleanup := tmpNamedTopicPartitions(t, pfx+"regular", 1)
+	defer topicCleanup()
+	group, groupCleanup := tmpShareGroup(t)
+	defer groupCleanup()
+
+	cl, _ := newTestClient(
+		ConsumeTopics(pfx+".*", regexp.QuoteMeta(internal)),
+		ConsumeRegex(),
+		ShareGroup(group),
+		MetadataMinAge(100*time.Millisecond),
+	)
+	defer cl.Close()
+	wait(t, 15*time.Second, func() error {
+		cl.triggerUpdateMetadataNow("querying metadata for consumer initialization")
+		if topics := cl.GetConsumeTopics(); len(topics) != 1 || topics[0] != topic {
+			return fmt.Errorf("expected to consume only %s, got %v", topic, topics)
+		}
+		return nil
+	})
+}
+
+// When the broker resolves our regex (KIP-848 with no excludes), it matches
+// the entire topic name and it does not skip internal topics. We wrap the
+// regex so that the broker matches anywhere in the name like we do, and we
+// adopt an internal topic the broker assigns.
+func Test848RegexBrokerResolves(t *testing.T) {
+	t.Parallel()
+	adm() // ensure allow848 is initialized
+	if !allow848 {
+		t.Skip("broker does not support KIP-848 (requires ConsumerGroupHeartbeat v1, Kafka 4+)")
+	}
+
+	pfx := randsha()[:16] + "-"
+	internal, producible, internalCleanup := internalTopic(t, pfx+"internal")
+	defer internalCleanup()
+	regular := []string{pfx + "orders", pfx + "orders-v2"}
+	var cleanup []func()
+	for _, name := range regular {
+		_, c := tmpNamedTopicPartitions(t, name, 1)
+		cleanup = append(cleanup, c)
+	}
+	defer func() {
+		for _, c := range cleanup {
+			c()
+		}
+	}()
+	group, groupCleanup := tmpGroup(t)
+	defer groupCleanup()
+
+	want := regular
+	if producible {
+		want = append(want, internal)
+	}
+	producer, _ := newTestClient()
+	defer producer.Close()
+	for _, topic := range want {
+		if err := producer.ProduceSync(context.Background(), &Record{Topic: topic, Value: []byte("v")}).FirstErr(); err != nil {
+			t.Fatalf("produce to %s: %v", topic, err)
+		}
+	}
+
+	cl, _ := newTestClient(
+		ServerSideBalancer(),
+		ConsumerGroup(group),
+		ConsumeRegex(),
+		// A bare name: matched by the broker alone, only pfx-orders
+		// would be consumed.
+		ConsumeTopics(pfx+"orders", regexp.QuoteMeta(internal)),
+		ConsumeResetOffset(NewOffset().AtStart()),
+		DisableAutoCommit(),
+		MetadataMinAge(100*time.Millisecond),
+		FetchMaxWait(250*time.Millisecond),
+	)
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seen := make(map[string]bool)
+	for len(seen) < len(want) && ctx.Err() == nil {
+		fs := cl.PollFetches(ctx)
+		fs.EachTopic(func(ft FetchTopic) {
+			if len(ft.Records()) > 0 {
+				seen[ft.Topic] = true
+			}
+		})
+	}
+	for _, topic := range want {
+		if !seen[topic] {
+			t.Errorf("did not consume from %s", topic)
+		}
+	}
+
+	// The broker assigned the internal topic to us and we adopted it.
+	wait(t, 15*time.Second, func() error {
+		if _, ok := cl.consumer.g.nowAssigned.read()[internal]; !ok {
+			return fmt.Errorf("%s is not assigned", internal)
+		}
+		if !slices.Contains(cl.GetConsumeTopics(), internal) {
+			return fmt.Errorf("%s is not consumed", internal)
+		}
+		return nil
+	})
+}
+
+// Ensure we only consume one partition if we only ask for one partition.
+func TestIssue337(t *testing.T) {
+	t.Parallel()
+
+	topic, cleanup := tmpTopicPartitions(t, 2)
+	defer cleanup()
+
+	cl, _ := newTestClient(
+		DefaultProduceTopic(topic),
+		RecordPartitioner(ManualPartitioner()),
+		UnknownTopicRetries(-1),
+		ConsumePartitions(map[string]map[int32]Offset{
+			topic: {0: NewOffset().At(0)},
+		}),
+	)
+	defer cl.Close()
+
+	if err := cl.ProduceSync(context.Background(),
+		&Record{Partition: 0, Value: []byte("foo")},
+		&Record{Partition: 1, Value: []byte("bar")},
+	).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var recs []*Record
+out:
+	for {
+		fs := cl.PollFetches(ctx)
+		switch err := fs.Err0(); err {
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		case context.DeadlineExceeded:
+			break out
+		case nil:
+		}
+		recs = append(recs, fs.Records()...)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("incorrect number of records, saw: %v", len(recs))
+	}
+	if string(recs[0].Value) != "foo" {
+		t.Fatalf("wrong value, got: %s", recs[0].Value)
+	}
+}
+
+func TestDirectPartitionPurge(t *testing.T) {
+	t.Parallel()
+
+	topic, cleanup := tmpTopicPartitions(t, 2)
+	defer cleanup()
+
+	cl, _ := newTestClient(
+		DefaultProduceTopic(topic),
+		RecordPartitioner(ManualPartitioner()),
+		UnknownTopicRetries(-1),
+		// Short FetchMaxWait so the post-AddConsumeTopics fetch loop
+		// cycles quickly: under heavy parallel load the cursor setup
+		// after metadata refresh can take a moment, and we want the
+		// next fetch attempt to fire promptly once cursors are live
+		// rather than stalling on the broker-side hang.
+		FetchMaxWait(250*time.Millisecond),
+		ConsumePartitions(map[string]map[int32]Offset{
+			topic: {0: NewOffset().At(0)},
+		}),
+	)
+	defer cl.Close()
+
+	if err := cl.ProduceSync(context.Background(),
+		&Record{Partition: 0, Value: []byte("foo")},
+		&Record{Partition: 1, Value: []byte("bar")},
+	).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	cl.PurgeTopicsFromClient(topic)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	fs := cl.PollFetches(ctx)
+	cancel()
+	if err := fs.Err0(); err != context.DeadlineExceeded {
+		t.Fatal("unexpected success when expecting context.DeadlineExceeded")
+	}
+
+	cl.AddConsumeTopics(topic)
+	ctx, cancel = context.WithTimeout(context.Background(), 7*time.Second)
+	defer cancel()
+
+	exp := map[string]bool{
+		"foo": true,
+		"bar": true,
+	}
+	for len(exp) > 0 {
+		fs := cl.PollFetches(ctx)
+		if err := fs.Err0(); err == context.DeadlineExceeded {
+			break
+		}
+		fs.EachRecord(func(r *Record) {
+			v := string(r.Value)
+			if !exp[v] {
+				t.Errorf("saw unexpected value %v", v)
+			}
+			delete(exp, v)
+		})
+	}
+	if len(exp) > 0 {
+		t.Errorf("did not see expected values %v", exp)
+	}
+}
+
+// Ensure a deleted topic while regex consuming is no longer fetched.
+func TestIssue434(t *testing.T) {
+	t.Parallel()
+
+	var (
+		t1, cleanup1 = tmpTopicPartitions(t, 1)
+		t2, cleanup2 = tmpTopicPartitions(t, 1)
+	)
+	defer cleanup1()
+	defer cleanup2()
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		ConsumeTopics(fmt.Sprintf("(%s|%s)", t1, t2)),
+		ConsumeRegex(),
+		FetchMaxWait(100*time.Millisecond),
+		KeepRetryableFetchErrors(),
+	)
+	defer cl.Close()
+
+	if err := cl.ProduceSync(context.Background(),
+		&Record{Topic: t1, Value: []byte("t1")},
+		&Record{Topic: t2, Value: []byte("t2")},
+	).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	cleanup2()
+
+	// This test is a slight heuristic check test. We are keeping retryable
+	// errors, so if the purge is successful, then we expect no response
+	// and we expect the fetch to just contain context.DeadlineExceeded.
+	//
+	// We can get the topic in the response for a little bit if our fetch
+	// is fast enough, so we ignore any errors (UNKNOWN_TOPIC_ID) at the
+	// start. We want to ensure the topic is just outright missing from
+	// the response because that will mean it is internally purged.
+	start := time.Now()
+	var missingTopic int
+	for missingTopic < 2 {
+		if time.Since(start) > 30*time.Second {
+			t.Fatal("still seeing topic after 30s")
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		fs := cl.PollFetches(ctx)
+		cancel()
+		var foundTopic bool
+		fs.EachTopic(func(ft FetchTopic) {
+			if ft.Topic == t2 {
+				foundTopic = true
+			}
+		})
+		if !foundTopic {
+			missingTopic++
+		}
+	}
+}
+
+func TestAddRemovePartitions(t *testing.T) {
+	t.Parallel()
+
+	t1, cleanup := tmpTopicPartitions(t, 2)
+	defer cleanup()
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		RecordPartitioner(ManualPartitioner()),
+		FetchMaxWait(100*time.Millisecond),
+	)
+	defer cl.Close()
+
+	if err := cl.ProduceSync(context.Background(),
+		&Record{Topic: t1, Partition: 0, Value: []byte("v1")},
+		&Record{Topic: t1, Partition: 1, Value: []byte("v2")},
+		&Record{Topic: t1, Partition: 1, Value: []byte("v3")},
+	).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+
+	cl.AddConsumePartitions(map[string]map[int32]Offset{
+		t1: {0: NewOffset().At(0)},
+	})
+
+	recs := cl.PollFetches(context.Background()).Records()
+	if len(recs) != 1 || string(recs[0].Value) != "v1" {
+		t.Fatalf("expected to see v1, got %v", recs)
+	}
+
+	cl.RemoveConsumePartitions(map[string][]int32{
+		t1:   {0, 1, 2},
+		"t2": {0, 1, 2},
+	})
+
+	cl.AddConsumePartitions(map[string]map[int32]Offset{
+		t1: {
+			0: NewOffset().At(0),
+			1: NewOffset().At(1),
+		},
+	})
+
+	recs = recs[:0]
+	for len(recs) < 2 {
+		recs = append(recs, cl.PollFetches(context.Background()).Records()...)
+	}
+	if len(recs) > 2 {
+		t.Fatalf("expected to see 2 records, got %v", recs)
+	}
+
+	sort.Slice(recs, func(i, j int) bool {
+		return recs[i].Partition < recs[j].Partition
+	})
+
+	if string(recs[0].Value) != "v1" || string(recs[1].Value) != "v3" {
+		t.Fatalf("expected to see v1 and v2, got %v", recs)
+	}
+}
+
+func closed(ch <-chan struct{}) bool {
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
+	}
+}
+
+func TestPauseIssue489(t *testing.T) {
+	t.Parallel()
+
+	t1, cleanup := tmpTopicPartitions(t, 3)
+	defer cleanup()
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		DefaultProduceTopic(t1),
+		RecordPartitioner(ManualPartitioner()),
+		ConsumeTopics(t1),
+		MetadataMinAge(100*time.Millisecond),
+		FetchMaxWait(100*time.Millisecond),
+	)
+	defer cl.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		var exit atomic.Bool
+		var which uint8
+		for !exit.Load() {
+			r := StringRecord("v")
+			r.Partition = int32(which % 3)
+			which++
+			cl.Produce(ctx, r, func(_ *Record, err error) {
+				if err == context.Canceled {
+					exit.Store(true)
+				}
+			})
+			cl.Flush(ctx)
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+	defer cancel()
+
+	for _, pollfn := range []struct {
+		name string
+		fn   func(context.Context) Fetches
+	}{
+		{"fetches", func(ctx context.Context) Fetches { return cl.PollFetches(ctx) }},
+		{"records", func(ctx context.Context) Fetches { return cl.PollRecords(ctx, 1000) }},
+	} {
+		for range 10 {
+			// Phase 1 and phase 2 each get their own budget so phase 1
+			// cannot starve phase 2 under parallel-test contention.
+			phase1Ctx, phase1Cancel := context.WithTimeout(ctx, 10*time.Second)
+			var sawZero, sawOne, sawTwo bool
+			for (!sawZero || !sawOne || !sawTwo) && !closed(phase1Ctx.Done()) {
+				fs := pollfn.fn(phase1Ctx)
+				fs.EachRecord(func(r *Record) {
+					sawZero = sawZero || r.Partition == 0
+					sawOne = sawOne || r.Partition == 1
+					sawTwo = sawTwo || r.Partition == 2
+				})
+			}
+			phase1Cancel()
+			cl.PauseFetchPartitions(map[string][]int32{t1: {0}})
+			sawZero, sawOne, sawTwo = false, false, false
+			phase2Ctx, phase2Cancel := context.WithTimeout(ctx, 10*time.Second)
+			for (!sawOne || !sawTwo) && !closed(phase2Ctx.Done()) {
+				fs := pollfn.fn(phase2Ctx)
+				fs.EachRecord(func(r *Record) {
+					sawZero = sawZero || r.Partition == 0
+					sawOne = sawOne || r.Partition == 1
+					sawTwo = sawTwo || r.Partition == 2
+				})
+			}
+			phase2Cancel()
+			if sawZero {
+				t.Fatalf("%s: saw partition zero even though it was paused", pollfn.name)
+			}
+			if !sawOne {
+				t.Fatalf("%s: did not see partition one even though it was not paused", pollfn.name)
+			}
+			if !sawTwo {
+				t.Fatalf("%s: did not see partition two even though it was not paused", pollfn.name)
+			}
+			cl.ResumeFetchPartitions(map[string][]int32{t1: {0}})
+		}
+	}
+}
+
+func TestPauseIssueOct2023(t *testing.T) {
+	t1, cleanup1 := tmpTopicPartitions(t, 1)
+	t2, cleanup2 := tmpTopicPartitions(t, 1)
+	t3, cleanup3 := tmpTopicPartitions(t, 1)
+	defer cleanup1()
+	defer cleanup2()
+	defer cleanup3()
+	ts := []string{t1, t2, t3}
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		ConsumeTopics(ts...),
+		MetadataMinAge(50*time.Millisecond),
+		FetchMaxWait(100*time.Millisecond),
+	)
+	defer cl.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		var exit atomic.Bool
+		var which int
+		for !exit.Load() {
+			r := StringRecord("v")
+			r.Topic = ts[which%len(ts)]
+			which++
+			cl.Produce(ctx, r, func(_ *Record, err error) {
+				if err == context.Canceled {
+					exit.Store(true)
+				}
+			})
+			cl.Flush(ctx)
+			time.Sleep(50 * time.Microsecond)
+		}
+	}()
+	defer cancel()
+
+	for _, pollfn := range []struct {
+		name string
+		fn   func(context.Context) Fetches
+	}{
+		{"fetches", func(ctx context.Context) Fetches { return cl.PollFetches(ctx) }},
+		{"records", func(ctx context.Context) Fetches { return cl.PollRecords(ctx, 1000) }},
+	} {
+		for range 10 {
+			ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			var sawt1, sawt2, sawt3 bool
+			for (!sawt1 || !sawt2 || !sawt3) && !closed(ctx.Done()) {
+				fs := pollfn.fn(ctx)
+				fs.EachRecord(func(r *Record) {
+					sawt1 = sawt1 || r.Topic == t1
+					sawt2 = sawt2 || r.Topic == t2
+					sawt3 = sawt3 || r.Topic == t3
+				})
+			}
+			cl.PauseFetchTopics(t1)
+			sawt1, sawt2, sawt3 = false, false, false
+			for i := 0; i < 10 && !closed(ctx.Done()); i++ {
+				fs := pollfn.fn(ctx)
+				fs.EachRecord(func(r *Record) {
+					sawt1 = sawt1 || r.Topic == t1
+					sawt2 = sawt2 || r.Topic == t2
+					sawt3 = sawt3 || r.Topic == t3
+				})
+			}
+			cancel()
+			if sawt1 {
+				t.Fatalf("%s: saw topic t1 even though it was paused", pollfn.name)
+			}
+			if !sawt2 {
+				t.Fatalf("%s: did not see topic t2 even though it was not paused", pollfn.name)
+			}
+			if !sawt3 {
+				t.Fatalf("%s: did not see topic t3 even though it was not paused", pollfn.name)
+			}
+			cl.ResumeFetchTopics(t1)
+		}
+	}
+}
+
+func TestIssue523(t *testing.T) {
+	t.Parallel()
+
+	for _, balancer := range []GroupBalancer{
+		RoundRobinBalancer(),
+		StickyBalancer(),
+	} {
+		t.Run(balancer.ProtocolName(), func(t *testing.T) {
+			t.Parallel()
+
+			t1, cleanup := tmpTopicPartitions(t, 1)
+			defer cleanup()
+			g1, gcleanup := tmpGroup(t)
+			defer gcleanup()
+
+			cl, _ := newTestClient(
+				DefaultProduceTopic(t1),
+				ConsumeTopics(".*"+t1+".*"),
+				ConsumeRegex(),
+				Balancers(balancer),
+				ConsumerGroup(g1),
+				MetadataMinAge(100*time.Millisecond),
+				FetchMaxWait(time.Second),
+				KeepRetryableFetchErrors(),
+				UnknownTopicRetries(-1),
+			)
+			defer cl.Close()
+
+			if err := cl.ProduceSync(context.Background(), StringRecord("foo")).FirstErr(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			fs := cl.PollFetches(ctx)
+			cancel()
+			if err := fs.Err0(); err != nil {
+				t.Fatalf("PollFetches: %v", err)
+			}
+
+			cleanup() // delete the topic
+
+			start := time.Now()
+			for {
+				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+				fs := cl.PollFetches(ctx)
+				cancel()
+				if errors.Is(fs.Err0(), context.DeadlineExceeded) {
+					break
+				}
+				if time.Since(start) > 40*time.Second { // missing topic delete is 15s by default
+					t.Fatalf("still repeatedly requesting metadata after 20s")
+				}
+				if fs.Err0() != nil {
+					time.Sleep(time.Second)
+				}
+			}
+		})
+	}
+}
+
+func TestIssue648(t *testing.T) {
+	t.Parallel()
+	cl, _ := newTestClient(
+		MetadataMinAge(100*time.Millisecond),
+		ConsumeTopics("bizbazbuz"),
+		FetchMaxWait(time.Second),
+		KeepRetryableFetchErrors(),
+	)
+	defer cl.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	fs := cl.PollFetches(ctx)
+	cancel()
+
+	var found bool
+	fs.EachError(func(_ string, _ int32, err error) {
+		if !errors.Is(err, kerr.UnknownTopicOrPartition) {
+			t.Errorf("expected ErrUnknownTopicOrPartition, got %v", err)
+		} else {
+			found = true
+		}
+	})
+	if !found {
+		t.Errorf("did not see ErrUnknownTopicOrPartition")
+	}
+}
+
+func TestIssue810(t *testing.T) {
+	t.Parallel()
+
+	t1, cleanup1 := tmpTopicPartitions(t, 1)
+	defer cleanup1()
+
+	_, cleanup2 := tmpTopicPartitions(t, 1)
+	defer cleanup2()
+
+	// Non-regex consuming: topics are available immediately.
+	{
+		cl, _ := newTestClient(
+			ConsumeTopics(t1),
+			UnknownTopicRetries(-1),
+		)
+		defer cl.Close()
+
+		topics := cl.GetConsumeTopics()
+		exp := []string{t1}
+
+		if !reflect.DeepEqual(topics, exp) {
+			t.Errorf("non-regex got %v != exp %v", topics, exp)
+		}
+	}
+
+	// Regex consuming: topics are available only after discovery.
+	{
+		cl, _ := newTestClient(
+			ConsumeTopics(t1),
+			ConsumeRegex(),
+			UnknownTopicRetries(-1),
+			MetadataMaxAge(time.Second),
+			MetadataMinAge(100*time.Millisecond),
+		)
+		defer cl.Close()
+
+		var (
+			ticker  = time.NewTicker(100 * time.Millisecond)
+			fail    = time.NewTimer(15 * time.Second)
+			failed  bool
+			lastSaw []string
+			exp     = []string{t1}
+		)
+
+		defer ticker.Stop()
+		defer fail.Stop()
+
+	out:
+		for {
+			select {
+			case <-ticker.C:
+				lastSaw = cl.GetConsumeTopics()
+				if reflect.DeepEqual(lastSaw, exp) {
+					break out
+				}
+				cl.ForceMetadataRefresh()
+			case <-fail.C:
+				failed = true
+				break out
+			}
+		}
+
+		if failed {
+			t.Errorf("did not see expected topics in time, last saw %v != exp %v", lastSaw, exp)
+		}
+	}
+}
+
+func TestIssue865(t *testing.T) {
+	t.Parallel()
+
+	t1, cleanup1 := tmpTopicPartitions(t, 1)
+	defer cleanup1()
+	t2, cleanup2 := tmpTopicPartitions(t, 1)
+	defer cleanup2()
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		ConsumeTopics(t1, t2),
+		FetchMaxWait(100*time.Millisecond),
+	)
+	defer cl.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const (
+		nrecs      = 10_000
+		flushEvery = 1000
+		pollAmount = 100
+	)
+
+	var wg sync.WaitGroup
+	for i := range nrecs {
+		r1 := StringRecord(strconv.Itoa(i))
+		r1.Topic = t1
+		wg.Add(1)
+		cl.Produce(ctx, r1, func(_ *Record, err error) {
+			defer wg.Done()
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		r2 := StringRecord(strconv.Itoa(i))
+		r2.Topic = t2
+		wg.Add(1)
+		cl.Produce(ctx, r2, func(_ *Record, err error) {
+			defer wg.Done()
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+
+		if i%flushEvery == 0 {
+			cl.Flush(ctx)
+		}
+	}
+
+	wg.Wait()
+
+	for i := 2 * nrecs; i > 0; {
+		ctx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+		fs := cl.PollRecords(ctx, 100)
+		cancel()
+		cl.ResumeFetchTopics(t2)
+		fs.EachRecord(func(r *Record) {
+			i--
+			if r.Topic == t2 {
+				cl.PauseFetchTopics(t2)
+			}
+		})
+	}
+
+	nrecbuf, nbytebuf := cl.BufferedFetchRecords(), cl.BufferedFetchBytes()
+
+	if nrecbuf != 0 {
+		t.Errorf("got rec buffered %d != 0", nrecbuf)
+	}
+	if nbytebuf != 0 {
+		t.Errorf("got byte buffered %d != 0", nbytebuf)
+	}
+}
+
+type testPooling struct {
+	t *testing.T
+
+	givenDecompress []byte
+	givenRecs       []Record
+
+	putDecompress bool
+	putRecs       bool
+}
+
+func (p *testPooling) GetDecompressBytes([]byte, CompressionCodecType) []byte {
+	r := make([]byte, 10<<10) // surely enough for the small amount we produce
+	p.givenDecompress = r
+	return r
+}
+
+func (p *testPooling) PutDecompressBytes(put []byte) {
+	if &put[0] != &p.givenDecompress[0] {
+		p.t.Error("PutDecompressByte != given!")
+	}
+	p.putDecompress = true
+}
+
+func (p *testPooling) GetRecords(int) []Record {
+	r := make([]Record, 100) // same
+	p.givenRecs = r
+	return r
+}
+
+func (p *testPooling) PutRecords(put []Record) {
+	if &put[0] != &p.givenRecs[0] {
+		p.t.Error("PutRecords != given!")
+	}
+	p.putRecs = true
+}
+
+func TestIssueFetchLargerThanBrokerMaxReadBytes(t *testing.T) {
+	t.Parallel()
+
+	maxMsg := "10485760"
+	topic, cleanup := tmpTopicPartitions(t, 1, kmsg.CreateTopicsRequestTopicConfig{Name: "max.message.bytes", Value: &maxMsg})
+	defer cleanup()
+
+	p, _ := newTestClient(DefaultProduceTopic(topic), ProducerBatchMaxBytes(8<<20))
+	defer p.Close()
+	v := make([]byte, 5<<20)
+	rand.Read(v) // incompressible, so the batch stays over the read limit
+	if err := p.ProduceSync(context.Background(), &Record{Value: v}).FirstErr(); err != nil {
+		t.Fatalf("unable to produce: %v", err)
+	}
+
+	// The broker returns the first batch even when it exceeds the fetch
+	// limits, and this one exceeds BrokerMaxReadBytes: we can never read
+	// it, and must say so rather than retry silently.
+	c, _ := newTestClient(ConsumeTopics(topic), FetchMaxBytes(1<<20), FetchMaxPartitionBytes(1<<20), BrokerMaxReadBytes(2<<20))
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	for _, fe := range c.PollFetches(ctx).Errors() {
+		if errors.Is(fe.Err, errResponseTooLarge) {
+			return
+		}
+	}
+	t.Fatal("did not get an error for a fetch response larger than BrokerMaxReadBytes")
+}
+
+func TestPooling(t *testing.T) {
+	t.Parallel()
+
+	var _ interface {
+		PoolDecompressBytes
+		PoolRecords
+	} = new(testPooling)
+
+	t1, cleanup1 := tmpTopicPartitions(t, 1)
+	defer cleanup1()
+
+	pool := &testPooling{t: t}
+
+	cl, _ := newTestClient(
+		UnknownTopicRetries(-1),
+		DefaultProduceTopic(t1),
+		ConsumeTopics(t1),
+		ManualFlushing(),
+		WithPools(pool),
+	)
+	defer cl.Close()
+
+	const nrecs = 10
+
+	var wg sync.WaitGroup
+	for range nrecs {
+		wg.Add(1)
+		r := StringRecord("foobarfoobarfoobarfoobar")
+		r.Headers = []RecordHeader{
+			{Key: "h1", Value: []byte("v1")},
+			{Key: "h2", Value: []byte("v2")},
+		}
+		cl.Produce(context.Background(), r, func(_ *Record, err error) {
+			defer wg.Done()
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+
+	cl.Flush(context.Background())
+	wg.Wait()
+
+	for consumed := 0; consumed < nrecs; {
+		fs := cl.PollFetches(context.Background())
+		consumed += fs.NumRecords()
+		fs.EachRecord(func(r *Record) {
+			if len(r.Headers) != 2 || r.Headers[0].Key != "h1" || r.Headers[1].Key != "h2" {
+				t.Errorf("got headers %v != [h1 h2]", r.Headers)
+			}
+			r.Recycle()
+		})
+	}
+
+	if !pool.putDecompress {
+		t.Error("did not put decompress!")
+	}
+	if !pool.putRecs {
+		t.Error("did not put recs!")
+	}
+}
+
+func TestGroupSimple(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name      string
+		enable848 bool
+	}{
+		{"classic", false},
+		{"848", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.enable848 && !allow848 {
+				t.Skip("broker does not support KIP-848 (requires ConsumerGroupHeartbeat, key 68)")
+			}
+
+			t1, cleanup := tmpTopicPartitions(t, 1)
+			defer cleanup()
+			g1, gcleanup := tmpGroup(t)
+			defer gcleanup()
+
+			opts := []Opt{
+				DefaultProduceTopic(t1),
+				ConsumeTopics(t1),
+				ConsumerGroup(g1),
+				MetadataMinAge(100 * time.Millisecond),
+				FetchMaxWait(time.Second),
+				UnknownTopicRetries(-1),
+			}
+			if tc.enable848 {
+				opts = append(opts, ServerSideBalancer())
+			}
+
+			cl, _ := newTestClient(opts...)
+			defer cl.Close()
+
+			for range 2 {
+				if err := cl.ProduceSync(context.Background(), StringRecord("foo")).FirstErr(); err != nil {
+					t.Fatal(err)
+				}
+
+				fs := cl.PollFetches(context.Background())
+
+				if errs := fs.Errors(); errs != nil {
+					t.Errorf("unexpected fetch errors: %v", errs)
+				}
+				if num := fs.NumRecords(); num != 1 {
+					t.Errorf("expected only one record, got %d", num)
+				}
+				if err := cl.CommitUncommittedOffsets(context.Background()); err != nil {
+					t.Errorf("unexpected err: %v", err)
+				}
+			}
+		})
+	}
+}
+
+type pollStartCountHook struct {
+	n atomic.Int64
+}
+
+func (h *pollStartCountHook) OnPollStart(_ context.Context) { h.n.Add(1) }
+
+func TestHookPollStart(t *testing.T) {
+	t.Parallel()
+
+	const nRecords = 5
+
+	for _, tc := range []struct {
+		name string
+		poll func(*Client, context.Context) Fetches
+	}{
+		{"PollRecords", func(cl *Client, ctx context.Context) Fetches { return cl.PollRecords(ctx, nRecords) }},
+		{"PollFetches", func(cl *Client, ctx context.Context) Fetches { return cl.PollFetches(ctx) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			topic, cleanup := tmpTopicPartitions(t, 1)
+			defer cleanup()
+
+			hook := &pollStartCountHook{}
+			cl, _ := newTestClient(
+				DefaultProduceTopic(topic),
+				UnknownTopicRetries(-1),
+				ConsumePartitions(map[string]map[int32]Offset{
+					topic: {0: NewOffset().At(0)},
+				}),
+				WithHooks(hook),
+			)
+			defer cl.Close()
+
+			recs := make([]*Record, nRecords)
+			for i := range recs {
+				recs[i] = StringRecord(strconv.Itoa(i))
+			}
+			if err := cl.ProduceSync(context.Background(), recs...).FirstErr(); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+
+			var pollCalls int64
+			var got int
+			for got < nRecords {
+				if ctx.Err() != nil {
+					t.Fatal("timed out waiting for records")
+				}
+				pollCalls++
+				fs := tc.poll(cl, ctx)
+				got += len(fs.Records())
+			}
+
+			if n := hook.n.Load(); n != pollCalls {
+				t.Fatalf("expected OnPollStart called %d times (one per poll call), got %d", pollCalls, n)
+			}
+		})
+	}
+}
+
+// pollWaitState packs the poller count in the low 32 bits and the waiting
+// rebalance count in the high 32. AllowRebalance zeroes the poller count; a
+// poll still in flight at that moment (a contract violation, but a silent and
+// otherwise permanent one) releases afterwards and must not decrement past
+// zero: the borrow would corrupt the rebalance bits and block both polls and
+// rebalances forever.
+func TestPollWaitStateNoUnderflow(t *testing.T) {
+	t.Parallel()
+
+	cl := &Client{cfg: cfg{blockRebalanceOnPoll: true}}
+	c := &consumer{cl: cl}
+	c.pollWaitC = sync.NewCond(&c.pollWaitMu)
+
+	c.waitAndAddPoller() // T1 polls and receives fetches; poller held
+	c.waitAndAddPoller() // T2 polls concurrently
+	c.allowRebalance()   // T1 done processing; user allows rebalances
+	c.unaddPoller()      // T2's poll found nothing; its deferred release lands
+
+	if state := c.pollWaitState; state != 0 {
+		t.Fatalf("got pollWaitState %#x != 0; poller release underflowed past AllowRebalance's reset", state)
+	}
+
+	// The real-world symptom of the underflow: the rebalance gate blocks
+	// forever even though no poller exists.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.waitAndAddRebalance()
+		c.unaddRebalance()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rebalance gate blocked after AllowRebalance raced a poll")
+	}
+}
+
+func TestLookbackMilli(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name  string
+		milli int64
+		d     time.Duration
+		want  int64
+	}{
+		{"no lookback", 1000000, 0, 1000000},
+		{"subtracts", 1000000, time.Second, 999000},
+		{"onto zero", 1000, time.Second, 1},
+		{"into the reserved range", 500, time.Second, 1},
+		{"a record below the epoch", -5000, time.Second, 1},
+		{"a subtraction that wraps", math.MinInt64 + 5, 24 * time.Hour, 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := lookbackMilli(test.milli, test.d); got != test.want {
+				t.Errorf("lookbackMilli(%d, %s) = %d, want %d", test.milli, test.d, got, test.want)
+			}
+		})
+	}
+}
+
+// A batch that decompresses past MaxDecompressBatchBytes stops the
+// partition: PollFetches returns ErrDecompressTooLarge once and nothing
+// more until SetOffsets skips the batch.
+func TestConsumeMaxDecompressBatchBytes(t *testing.T) {
+	t.Parallel()
+
+	topic, cleanup := tmpTopicPartitions(t, 1)
+	defer cleanup()
+
+	producer, _ := newTestClient(
+		DefaultProduceTopic(topic),
+		ProducerBatchMaxBytes(4<<20),
+		ProducerBatchCompression(GzipCompression()),
+		ProducerLinger(time.Second),
+	)
+	defer producer.Close()
+
+	// Three 1MiB records of zeros land in one batch that gzips to a few
+	// KB and decompresses to 3MiB.
+	big := make([]byte, 1<<20)
+	if err := producer.ProduceSync(context.Background(),
+		&Record{Value: big},
+		&Record{Value: big},
+		&Record{Value: big},
+	).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+
+	cl, _ := newTestClient(
+		MaxDecompressBatchBytes(1<<20),
+		ConsumePartitions(map[string]map[int32]Offset{
+			topic: {0: NewOffset().At(0)},
+		}),
+	)
+	defer cl.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	fs := cl.PollFetches(ctx)
+	tooLarge, ok := errors.AsType[*ErrDecompressTooLarge](fs.Err0())
+	if !ok {
+		t.Fatalf("got err %v, want ErrDecompressTooLarge", fs.Err0())
+	}
+	if tooLarge.Topic != topic || tooLarge.Partition != 0 || tooLarge.Offset != 0 || tooLarge.NextOffset != 3 {
+		t.Fatalf("got %+v, want offset 0 through 3 on %s/0", tooLarge, topic)
+	}
+	if !errors.Is(fs.Err0(), ErrMaxDecompress) {
+		t.Fatalf("err %v does not unwrap to ErrMaxDecompress", fs.Err0())
+	}
+
+	// The partition is stopped: a following small record is not fetched.
+	if err := producer.ProduceSync(context.Background(), &Record{Value: []byte("after")}).FirstErr(); err != nil {
+		t.Fatal(err)
+	}
+	quiet, cancelQuiet := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelQuiet()
+	if fs := cl.PollFetches(quiet); fs.Err0() != context.DeadlineExceeded {
+		t.Fatalf("stopped partition still polled: err %v, %d records", fs.Err0(), len(fs.Records()))
+	}
+
+	cl.SetOffsets(map[string]map[int32]EpochOffset{
+		topic: {0: {Epoch: tooLarge.Epoch, Offset: tooLarge.NextOffset}},
+	})
+	fs = cl.PollFetches(ctx)
+	if err := fs.Err0(); err != nil {
+		t.Fatalf("unexpected error after SetOffsets: %v", err)
+	}
+	recs := fs.Records()
+	if len(recs) != 1 || recs[0].Offset != 3 || string(recs[0].Value) != "after" {
+		t.Fatalf("after SetOffsets, got %d records (first offset/value %v), want offset 3 %q", len(recs), recs, "after")
+	}
+}

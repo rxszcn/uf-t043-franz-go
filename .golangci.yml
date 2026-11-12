@@ -1,0 +1,216 @@
+version: "2"
+run:
+  go: "1.24"
+  allow-parallel-runners: true
+linters:
+  default: none
+  enable:
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+
+    - asasalint
+    - asciicheck
+    - bidichk
+    - bodyclose
+    - copyloopvar
+    - decorder
+    - durationcheck
+    - durationcheck
+    - exptostd
+    - fatcontext
+    - forbidigo
+    - gocheckcompilerdirectives
+    - gochecksumtype
+    - gocritic
+    - goprintffuncname
+    - gosec
+    - gosmopolitan
+    - grouper
+    - iface
+    - importas
+    - makezero
+    - mirror
+    - misspell
+    - nilerr
+    - noctx
+    - nolintlint
+    - revive
+    - rowserrcheck
+    - spancheck
+    - sqlclosecheck
+    - unconvert
+    - usestdlibvars
+    - usetesting
+    - wastedassign
+    - whitespace
+
+  settings:
+
+    errorlint:
+      errorf: false
+
+    forbidigo:
+      # In pkg/kgo non-test files we require xsync.Mutex / xsync.RWMutex.
+      # This lets testing/synctest treat mutex blocking as durably blocked;
+      # see pkg/kgo/internal/xsync.
+      forbid:
+        - pattern: ^sync\.Mutex$
+          msg: use xsync.Mutex in pkg/kgo so testing/synctest treats mutex waits as durably blocked
+        - pattern: ^sync\.RWMutex$
+          msg: use xsync.RWMutex in pkg/kgo so testing/synctest treats mutex waits as durably blocked
+      analyze-types: true
+
+    gocritic:
+      disabled-checks:
+        - appendAssign
+        - builtinShadow
+        - commentedOutCode
+        - emptyStringTest
+        - evalOrder
+        - ifElseChain
+        - importShadow
+        - nestingReduce # stylistic - sometimes the positive condition reads better
+        - ptrToRefParam
+        - sloppyReassign
+        - tooManyResultsChecker
+        - typeDefFirst
+        - unnamedResult
+        - unnecessaryBlock
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+      settings:
+        hugeParam:
+          sizeThreshold: 256
+        rangeValCopy:
+          sizeThreshold: 256
+
+    gosec:
+      excludes:
+        - G104
+        - G109 # int overflow from Atoi to int32 - all instances are small values (broker IDs, ports)
+        - G404
+        - G115
+        - G117
+        - G301 # directory permissions 0o755 - standard for data directories
+        - G302 # file permissions 0o644 - standard for data files
+        - G304 # file inclusion via variable - unavoidable for any filesystem code
+        - G306 # WriteFile permissions 0o644 - standard for data files
+        - G602 # https://github.com/securego/gosec/issues/1406
+        - G118 # does not track cancel funcs passed to goroutines or stored in structs
+        - G703 # path traversal via taint analysis - all instances are tests or kfake persistence writing to controlled directories
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+      allow-unused: false
+
+    revive:
+      confidence: 0.8
+      severity: warning
+      rules:
+        - name: atomic
+        - name: blank-imports
+        - name: bool-literal-in-expr
+        - name: call-to-gc
+        - name: constant-logical-expr
+        - name: context-as-argument
+        - name: context-keys-type
+        - name: defer
+        - name: dot-imports
+        - name: duplicated-imports
+        - name: early-return
+        - name: empty-block
+        - name: empty-lines
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: errorf
+        - name: get-return
+        - name: identical-branches
+        - name: if-return
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: optimize-operands-order
+        - name: range
+        - name: range-val-in-closure
+        - name: receiver-naming
+        - name: string-of-int
+        - name: struct-tag
+        - name: superfluous-else
+        - name: time-equal
+        - name: time-naming
+        - name: var-declaration
+        - name: unconditional-recursion
+        - name: unexported-naming
+        - name: unexported-return
+        - name: unnecessary-stmt
+        - name: unreachable-code
+        - name: unused-parameter
+        - name: unused-receiver
+        - name: useless-break
+        - name: waitgroup-by-value
+
+    staticcheck:
+      checks:
+        - all
+        - -SA1012
+        - -SA1019
+        - -SA1029 # context.WithValue with string key - deliberate for 848 opt-in
+        - -ST1003
+        - -ST1016
+        - -QF1001
+        - -QF1006 # suggests lifting break condition into for - doesn't fit when loops have multiple break conditions
+        - -QF1008 # suggests removing embedded field from selector - explicit selector is clearer
+
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+      - pkg/kmsg/generated\.go$ # generated from generate/definitions - fix typos there, not here
+    rules:
+      # A kfake request handler answers the client with an error code inside
+      # the response and returns no error to the connection; nilerr reads
+      # returning that response as swallowing the error.
+      - linters: [nilerr]
+        path: ^pkg/kfake/[0-9]+_
+      - linters: [noctx] # test code doesn't need request contexts
+        path: _test\.go$
+      - linters: [revive]
+        text: "unused-parameter" # test callbacks must match required function signatures
+        path: _test\.go$
+      - linters: [revive]
+        text: "context-keys-type" # 848 opt-in uses deliberate string key
+        path: _test\.go$
+      # forbidigo (sync.Mutex/RWMutex ban) only applies to non-test pkg/kgo
+      # files directly in pkg/kgo/. The xsync package itself wraps sync, and
+      # kgo tests can still use sync.Mutex.
+      - linters: [forbidigo]
+        path-except: ^pkg/kgo/[^/]+\.go$
+      - linters: [forbidigo]
+        path: _test\.go$
+
+issues:
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/twmb/franz-go
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
